@@ -25,31 +25,34 @@ class CNNFeatureExtractor(nn.Module):
         input_channels (int): Number of input channels (default: 1 for single PPG signal)
     """
 
-    def __init__(self, input_channels=1):
+    def __init__(self, input_channels=1, dropout=0.5):
         super(CNNFeatureExtractor, self).__init__()
 
         self.conv1 = nn.Sequential(
-            nn.Conv1d(input_channels, 64, kernel_size=3, padding=1),
-            nn.BatchNorm1d(64),
+            nn.Conv1d(input_channels, 32, kernel_size=3, padding=1),
+            nn.BatchNorm1d(32),
             nn.ReLU(),
+            nn.Dropout(dropout),
             nn.MaxPool1d(kernel_size=2)
         )
 
         self.conv2 = nn.Sequential(
-            nn.Conv1d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm1d(128),
+            nn.Conv1d(32, 64, kernel_size=3, padding=1),
+            nn.BatchNorm1d(64),
             nn.ReLU(),
+            nn.Dropout(dropout),
             nn.MaxPool1d(kernel_size=2)
         )
 
         self.conv3 = nn.Sequential(
-            nn.Conv1d(128, 256, kernel_size=3, padding=1),
-            nn.BatchNorm1d(256),
+            nn.Conv1d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm1d(128),
             nn.ReLU(),
+            nn.Dropout(dropout),
             nn.MaxPool1d(kernel_size=2)
         )
 
-        self.output_channels = 256
+        self.output_channels = 128
 
     def forward(self, x):
         """

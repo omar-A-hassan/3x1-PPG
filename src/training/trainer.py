@@ -32,7 +32,7 @@ class Trainer:
         weight_decay (float): L2 regularization (default: 1e-5)
     """
 
-    def __init__(self, model, device='cuda', learning_rate=0.001, weight_decay=1e-5):
+    def __init__(self, model, device='cuda', learning_rate=0.001, weight_decay=0.01):
         self.model = model.to(device)
         self.device = device
         self.learning_rate = learning_rate

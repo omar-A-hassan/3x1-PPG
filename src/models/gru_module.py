@@ -27,30 +27,34 @@ class GRUTemporalModel(nn.Module):
         hidden_size_2 (int): Hidden units in second GRU layer (default: 64)
     """
 
-    def __init__(self, input_size=256, hidden_size_1=128, hidden_size_2=64):
+    def __init__(self, input_size=256, hidden_size_1=64, hidden_size_2=32, dropout=0.5):
         super(GRUTemporalModel, self).__init__()
 
         self.input_size = input_size
         self.hidden_size_1 = hidden_size_1
         self.hidden_size_2 = hidden_size_2
 
-        # First GRU layer
+        # First GRU layer with dropout
         self.gru1 = nn.GRU(
             input_size=input_size,
             hidden_size=hidden_size_1,
             num_layers=1,
             batch_first=True,
+            dropout=0,
             bidirectional=False
         )
+        self.dropout1 = nn.Dropout(dropout)
 
-        # Second GRU layer
+        # Second GRU layer with dropout
         self.gru2 = nn.GRU(
             input_size=hidden_size_1,
             hidden_size=hidden_size_2,
             num_layers=1,
             batch_first=True,
+            dropout=0,
             bidirectional=False
         )
+        self.dropout2 = nn.Dropout(dropout)
 
         self.output_size = hidden_size_2
 
@@ -65,13 +69,15 @@ class GRUTemporalModel(nn.Module):
             Last hidden state (batch_size, hidden_size_2)
         """
         # First GRU layer
-        x, _ = self.gru1(x)  # (batch, seq, 128)
+        x, _ = self.gru1(x)  # (batch, seq, 64)
+        x = self.dropout1(x)
 
         # Second GRU layer
-        x, _ = self.gru2(x)  # (batch, seq, 64)
+        x, _ = self.gru2(x)  # (batch, seq, 32)
+        x = self.dropout2(x)
 
         # Return last timestep
-        x = x[:, -1, :]      # (batch, 64)
+        x = x[:, -1, :]      # (batch, 32)
 
         return x
 

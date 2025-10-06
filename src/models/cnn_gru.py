@@ -33,18 +33,18 @@ class CNNGRU(nn.Module):
         dropout (float): Dropout rate for regularization (default: 0.3)
     """
 
-    def __init__(self, input_length=100, input_channels=1, dropout=0.3):
+    def __init__(self, input_length=100, input_channels=1, dropout=0.5):
         super(CNNGRU, self).__init__()
 
         self.input_length = input_length
         self.input_channels = input_channels
 
         # CNN module for spatial feature extraction
-        self.cnn = CNNFeatureExtractor(input_channels=input_channels)
+        self.cnn = CNNFeatureExtractor(input_channels=input_channels, dropout=dropout)
 
-        # GRU module for temporal modeling
+        # GRU module for temporal modeling with dropout
         # Input size = CNN output channels (256)
-        self.gru = GRUTemporalModel(input_size=self.cnn.output_channels)
+        self.gru = GRUTemporalModel(input_size=self.cnn.output_channels, dropout=dropout)
 
         # Dense layers for final prediction
         self.fc1 = nn.Linear(self.gru.output_size, 32)
@@ -89,7 +89,7 @@ class CNNGRU(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
-def build_cnn_gru(input_length=100, dropout=0.3):
+def build_cnn_gru(input_length=100, dropout=0.5):
     """
     Factory function to build CNN-GRU model with specified parameters.
 
