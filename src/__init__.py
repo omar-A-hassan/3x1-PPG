@@ -12,6 +12,5 @@ __all__ = [
     'models',
     'preprocessing',
     'training',
-    'evaluation',
-    'utils'
+    'evaluation'
 ]
