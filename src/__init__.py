@@ -6,7 +6,7 @@ from . import models
 from . import preprocessing
 from . import training
 from . import evaluation
-from . import utils
+
 
 __all__ = [
     'models',
