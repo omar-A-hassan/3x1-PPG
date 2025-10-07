@@ -103,7 +103,6 @@ class xLSTMPPGRegressor(nn.Module):
                     mLSTMBlockConfig(
                         mlstm=mLSTMLayerConfig(
                             num_heads=4,
-                            backend="vanilla",
                         ),
                         feedforward=FeedForwardConfig(
                             proj_factor=1.3,
