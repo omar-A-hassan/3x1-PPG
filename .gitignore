@@ -7,3 +7,11 @@ training/*
 scripts/_nohup
 .rsync-filter
 *.pdf
+
+# Training artifacts
+checkpoints/
+*/checkpoints/
+*.pt
+
+# Test outputs
+test_checkpoints/
