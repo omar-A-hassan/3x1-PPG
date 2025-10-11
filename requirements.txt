@@ -1,5 +1,5 @@
 # Deep Learning & Core
-torch==1.8.1
+torch
 numpy==1.19.2
 scipy==1.6.1
 
