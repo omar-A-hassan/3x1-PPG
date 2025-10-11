@@ -1,0 +1,9 @@
+/datasets/*[!.py]
+.ipynb_checkpoints
+__pycache__/
+*.py[cod]
+*$py.class
+training/*
+scripts/_nohup
+.rsync-filter
+*.pdf

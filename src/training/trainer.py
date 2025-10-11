@@ -92,6 +92,10 @@ class Trainer:
             # Backward pass
             self.optimizer.zero_grad()
             loss.backward()
+
+            # Gradient clipping to prevent explosion (critical for deep networks)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+
             self.optimizer.step()
 
             # Metrics
