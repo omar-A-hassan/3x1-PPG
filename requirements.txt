@@ -1,6 +1,6 @@
 # Deep Learning & Core
 torch
-numpy==1.19.2
+numpy
 scipy==1.6.1
 
 # Data Processing
