@@ -229,11 +229,11 @@ class TS2VecPPGTrainer:
             verbose=verbose
         )
 
-        if loss_log and len(loss_log) > 0:
+        if loss_log is not None and isinstance(loss_log, list) and len(loss_log) > 0:
             print(f"\nPre-training completed! Final loss: {loss_log[-1]:.4f}")
         else:
             print("\nPre-training completed!")
-        return loss_log
+        return loss_log if loss_log is not None else []
 
     def build_regression_model(self, freeze_encoder=True, dropout=0.1):
         """
