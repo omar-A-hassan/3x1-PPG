@@ -30,13 +30,15 @@ class Trainer:
         device (str): Device to train on ('cuda' or 'cpu')
         learning_rate (float): Initial learning rate (default: 0.001)
         weight_decay (float): L2 regularization (default: 1e-5)
+        checkpoint_dir (str): Directory to save checkpoints (default: 'checkpoints')
     """
 
-    def __init__(self, model, device='cuda', learning_rate=0.001, weight_decay=0.01):
+    def __init__(self, model, device='cuda', learning_rate=0.001, weight_decay=0.01, checkpoint_dir='checkpoints'):
         self.model = model.to(device)
         self.device = device
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
+        self.checkpoint_dir = Path(checkpoint_dir)
 
         # Loss function
         self.criterion = nn.MSELoss()
@@ -53,8 +55,7 @@ class Trainer:
             self.optimizer,
             mode='min',
             factor=0.5,
-            patience=5,
-            verbose=True
+            patience=5
         )
 
         # Training history
@@ -68,6 +69,7 @@ class Trainer:
 
         # Best model tracking
         self.best_val_loss = float('inf')
+        self.best_val_mae = float('inf')
         self.best_epoch = 0
 
     def compute_mae(self, predictions, targets):
@@ -128,6 +130,58 @@ class Trainer:
 
         return epoch_loss / n_batches, epoch_mae / n_batches
 
+    def train(
+        self,
+        X_train,
+        y_train,
+        X_val,
+        y_val,
+        batch_size=32,
+        epochs=100,
+        learning_rate=None,
+        patience=15,
+        min_delta=0.0
+    ):
+        """
+        Train model with tensors directly (convenience method for notebooks).
+
+        Args:
+            X_train (torch.Tensor): Training input data
+            y_train (torch.Tensor): Training target data
+            X_val (torch.Tensor): Validation input data
+            y_val (torch.Tensor): Validation target data
+            batch_size (int): Batch size for training
+            epochs (int): Maximum number of epochs
+            learning_rate (float): Learning rate (if None, uses initialization value)
+            patience (int): Early stopping patience
+            min_delta (float): Minimum change to qualify as improvement
+
+        Returns:
+            dict: Training history
+        """
+        # Update learning rate if provided
+        if learning_rate is not None:
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = learning_rate
+            self.learning_rate = learning_rate
+
+        # Create data loaders
+        train_dataset = TensorDataset(X_train, y_train)
+        val_dataset = TensorDataset(X_val, y_val)
+
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
+        # Train using fit method
+        return self.fit(
+            train_loader=train_loader,
+            val_loader=val_loader,
+            epochs=epochs,
+            early_stopping_patience=patience,
+            save_dir=str(self.checkpoint_dir),
+            verbose=True
+        )
+
     def fit(
         self,
         train_loader,
@@ -181,6 +235,7 @@ class Trainer:
             # Save best model
             if val_loss < self.best_val_loss:
                 self.best_val_loss = val_loss
+                self.best_val_mae = val_mae
                 self.best_epoch = epoch
                 patience_counter = 0
 
