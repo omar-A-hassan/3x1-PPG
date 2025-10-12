@@ -215,36 +215,6 @@ def save_all_data():
         print(f"Data saved to: {filename}")
         print(f"{'='*60}\n")
         
-        # Save summary statistics
-        stats_filename = f'acquisition_stats_{timestamp}.txt'
-        with open(stats_filename, 'w') as f:
-            f.write(f"MAX30102 Data Acquisition Summary\n")
-            f.write(f"{'='*60}\n")
-            f.write(f"Timestamp: {timestamp}\n")
-            f.write(f"Total Samples: {len(df):,}\n")
-            f.write(f"Missed Samples: {missed_samples}\n")
-            f.write(f"Loss Rate: {(missed_samples / max(len(df), 1)) * 100:.4f}%\n")
-            f.write(f"Duration: {df['Timestamp'].max():.2f} seconds\n")
-            f.write(f"Average Rate: {len(df) / df['Timestamp'].max():.2f} Hz\n")
-            f.write(f"Red - Min: {df['Red'].min()}, Max: {df['Red'].max()}, Mean: {df['Red'].mean():.2f}\n")
-            f.write(f"IR  - Min: {df['IR'].min()}, Max: {df['IR'].max()}, Mean: {df['IR'].mean():.2f}\n")
-            
-            # Check for sample gaps
-            if len(df) > 1:
-                df_sorted = df.sort_values('SampleNum')
-                gaps = df_sorted['SampleNum'].diff()
-                gap_locations = gaps[gaps > 1]
-                if len(gap_locations) > 0:
-                    f.write(f"\nGaps detected at sample numbers:\n")
-                    for idx, gap in gap_locations.items():
-                        f.write(f"  Sample {df_sorted.loc[idx, 'SampleNum']}: gap of {int(gap)-1} samples\n")
-        
-        print(f"Statistics saved to: {stats_filename}")
-        return True
-    else:
-        print("No data to save!")
-        return False
-
 def on_close(event):
     """Handle window close event"""
     print("\nClosing acquisition...")

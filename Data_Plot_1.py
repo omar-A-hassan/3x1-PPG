@@ -9,7 +9,7 @@ import numpy as np
 from datetime import timedelta
 import sys
 
-path = Path('max30102_data_20251008_205235.csv')
+path = Path('max30102_data_20251009_151555.csv')
 
 def format_duration(seconds: float) -> str:
     # Simple H:MM:SS.sss formatting
