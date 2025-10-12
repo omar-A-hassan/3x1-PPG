@@ -11,7 +11,7 @@ import queue
 
 # Configuration
 PORT = 'COM6'  # Change to your port
-BAUD_RATE = 921600  # Must match Arduino (increased from 115200)
+BAUD_RATE = 115200  # Must match Arduino (increased from 115200)
 MAX_POINTS = 3000  # Display last 10 seconds at 300Hz
 SAVE_INTERVAL = 1000  # Save to disk every 1000 samples
 
