@@ -1,0 +1,46 @@
+version: '3.8'
+
+services:
+  ble_receiver:
+    build: ./services/ble_receiver
+    ports:
+      - "8000:8000"
+    networks:
+      - ppg_network
+    environment:
+      - PREPROCESSING_SERVICE_URL=http://preprocessing:8001
+    restart: unless-stopped
+
+  preprocessing:
+    build: ./services/preprocessing
+    ports:
+      - "8001:8001"
+    networks:
+      - ppg_network
+    environment:
+      - MODEL_SERVICE_URL=http://model:8002
+    restart: unless-stopped
+
+  model:
+    build:
+      context: .
+      dockerfile: services/model/Dockerfile
+    ports:
+      - "8002:8002"
+    networks:
+      - ppg_network
+    environment:
+      - UI_SERVICE_URL=http://ui:8003
+    restart: unless-stopped
+
+  ui:
+    build: ./services/ui
+    ports:
+      - "8003:8003"
+    networks:
+      - ppg_network
+    restart: unless-stopped
+
+networks:
+  ppg_network:
+    driver: bridge
