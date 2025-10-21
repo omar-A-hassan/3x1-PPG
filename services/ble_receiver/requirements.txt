@@ -4,3 +4,4 @@ pydantic==2.5.0
 httpx==0.25.1
 bleak==0.21.1
 numpy==1.24.3
+websocket-client==1.9.0
