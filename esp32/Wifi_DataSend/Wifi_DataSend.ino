@@ -26,7 +26,7 @@
 
 #define SAMPLING_RATE 100
 #define COLLECTION_TIME 60
-#define TOTAL_SAMPLES (SAMPLING_RATE * COLLECTION_TIME)  // 6000 samples
+#define TOTAL_SAMPLES (SAMPLING_RATE * COLLECTION_TIME)  
 #define SAMPLE_INTERVAL_MS (1000 / SAMPLING_RATE)
 
 // WiFi Configuration (Choose one)
@@ -44,7 +44,7 @@
 #define WEBSOCKET_PORT 81
 
 // Quality thresholds
-#define MIN_IR_THRESHOLD 50000
+#define MIN_IR_THRESHOLD 12500
 #define MAX_IR_THRESHOLD 200000
 
 // ---------- GLOBALS ----------

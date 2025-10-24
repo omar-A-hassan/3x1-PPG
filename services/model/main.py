@@ -3,7 +3,7 @@ Model Service
 Loads best_model.pt and runs inference on preprocessed PPG segments
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from pydantic import BaseModel
 import httpx
 import numpy as np
@@ -13,6 +13,7 @@ import logging
 from pathlib import Path
 from typing import List, Optional
 import os
+import pandas as pd
 
 # Set PyTorch to avoid potential issues in Docker
 os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
@@ -174,31 +175,56 @@ class ModelInference:
 # Global model instance
 model_inference = None
 
+
 @app.on_event("startup")
 async def startup_event():
-    """Load model on startup"""
     global model_inference
-    
-    # In container, model is at /app/best_model.pt
-    model_path = Path("/app/best_model.pt")
-    if not model_path.exists():
-        # Try local path for development
-        model_path = PROJECT_ROOT / "best_model.pt"
-    
+    model_path = Path(r"C:\Users\nazeh\BioInfo Trials\3x1-PPG\Dev\3x1-PPG\services\model\best_model.pt")
+
     if not model_path.exists():
         logger.error(f"Model file not found: {model_path}")
         raise FileNotFoundError(f"Model file not found: {model_path}")
-    
-    logger.info(f"Initializing model from {model_path}")
+
+    logger.info(f"Model file found at: {model_path}")
+
     model_inference = ModelInference(str(model_path))
-    logger.info("Model service ready")
+    logger.info("✅ Model loaded successfully and ready for inference.")
+
+    try:
+        # ✅ Import the same model builder used in Docker
+        from src.models.ts2vec_ppg import build_tsencoder_ppg
+
+        # Build architecture (must match what was trained)
+        model = build_tsencoder_ppg(
+            input_dims=1,
+            output_dims=320,
+            hidden_dims=64,
+            depth=10,
+            dropout=0.1
+        )
+
+        checkpoint = torch.load(model_path, map_location=torch.device("cpu"))
+
+        # Handle different checkpoint formats
+        if "model_state_dict" in checkpoint:
+            model.load_state_dict(checkpoint["model_state_dict"])
+        elif "state_dict" in checkpoint:
+            model.load_state_dict(checkpoint["state_dict"])
+        else:
+            model.load_state_dict(checkpoint)
+
+        model.eval()  # ready for inference
+
+    except Exception as e:
+        logger.error(f"Failed to load model: {e}", exc_info=True)
+        raise RuntimeError(f"Failed to load model: {e}")
 
 @app.get("/")
 async def root():
     return {
         "service": "Model Service",
         "status": "ready",
-        "device": str(model_inference.device) if model_inference else "not initialized"
+        "device": str(next(model_inference.parameters()).device) if model_inference else "not initialized"
     }
 
 @app.get("/health")
@@ -212,6 +238,41 @@ async def health():
         "device": str(model_inference.device),
         "model_path": model_inference.model_path
     }
+
+
+@app.post("/predict_from_csv", response_model=PredictResponse)
+async def predict_from_csv(file: UploadFile = File(...), quality_score: float = 1.0):
+    """
+    Run inference on uploaded CSV file containing preprocessed PPG segments.
+    Each row is a segment.
+    """
+    try:
+        if model_inference is None:
+            raise HTTPException(status_code=503, detail="Model not initialized")
+        
+        # Load CSV into DataFrame
+        df = pd.read_csv(file.file)
+        segments = df.values.astype(np.float32)
+        
+        logger.info(f"Loaded CSV with shape {segments.shape}")
+
+        if segments.ndim == 1:
+            segments = np.expand_dims(segments, axis=0)
+
+        # Run inference
+        glucose_pred = model_inference.predict(segments)
+
+        return PredictResponse(
+            success=True,
+            glucose_prediction=glucose_pred,
+            num_segments=len(segments),
+            quality_score=quality_score,
+            device=str(model_inference.device)
+        )
+        
+    except Exception as e:
+        logger.error(f"Prediction from CSV failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/predict", response_model=PredictResponse)
 async def predict(request: PredictRequest):
