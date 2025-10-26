@@ -15,10 +15,10 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy your main Wi-Fi communication file
-COPY Wifi_main.py .
+COPY Wifi_main_csv.py .
 
 # Expose port 8000 (FastAPI)
 EXPOSE 8000
 
 # Run the FastAPI Wi-Fi receiver
-CMD ["uvicorn", "Wifi_main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "Wifi_main_csv:app", "--host", "0.0.0.0", "--port", "8000"]

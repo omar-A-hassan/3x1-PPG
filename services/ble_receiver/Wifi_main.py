@@ -49,10 +49,31 @@ class CollectionStatus(BaseModel):
 
 @app.on_event("startup")
 async def _startup():
-    # capture main event loop so background WS thread can schedule coroutines
+    """
+    Startup: capture event loop and try automatic ESP32 connection.
+    """
     global main_event_loop
     main_event_loop = asyncio.get_event_loop()
     logger.info("Startup: captured event loop for thread callbacks")
+
+    ws_url = "ws://192.168.4.1:81/"
+    max_retries = 5
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            logger.info(f"[Auto-Connect] Attempt {attempt} to connect to ESP32 at {ws_url}")
+            _start_ws_thread(ws_url)
+            await asyncio.sleep(2.0)  # allow connection time
+            logger.info("[Auto-Connect] Thread started — waiting for connection...")
+            await asyncio.sleep(2.0)
+            logger.info("[Auto-Connect] Success — ESP32 should now be connected.")
+            break
+        except Exception as e:
+            logger.warning(f"[Auto-Connect] Attempt {attempt} failed: {e}")
+            await asyncio.sleep(3.0)
+    else:
+        logger.error(f"[Auto-Connect] Failed to connect after {max_retries} attempts.")
+
 
 @app.get("/")
 async def root():

@@ -289,7 +289,7 @@ def main():
     # ========================================================================
     
     # CHANGE THIS to your CSV file path
-    csv_file = Path(r"Dev\3x1-PPG\services\ble_receiver\ppg_data\ppg_data_20251024_040102.csv")
+    csv_file = Path(r"Dev\3x1-PPG\services\ble_receiver\ppg_data\ppg_data_20251024_151652.csv")
     # Or use any of these formats:
     # csv_file = "max30102_data_20251009_151555.csv"
     # csv_file = "max30102_processed_20251013_143045.csv"

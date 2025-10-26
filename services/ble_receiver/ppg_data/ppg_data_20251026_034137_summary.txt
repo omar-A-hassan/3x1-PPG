@@ -1,0 +1,27 @@
+============================================================
+PPG DATA COLLECTION SUMMARY
+============================================================
+
+Collection Timestamp: 20251026_034137
+Start Time: 2025-10-26T03:39:34.992449
+End Time: 2025-10-26T03:41:37.404508
+Device: ESP32-PPG-Glucose
+
+Sample Rate: 300 Hz
+Total Samples: 6000
+Duration: 20 seconds
+
+Signal Statistics:
+  Mean:   22947.30
+  Std:    512.85
+  Min:    21232.00
+  Max:    26416.00
+  Median: 22884.00
+
+============================================================
+Data Files:
+============================================================
+  NPY: ppg_data\ppg_data_20251026_034137.npy
+  CSV: ppg_data\ppg_data_20251026_034137.csv
+  JSON: ppg_data\ppg_data_20251026_034137.json
+  METADATA: ppg_data\ppg_data_20251026_034137_metadata.json

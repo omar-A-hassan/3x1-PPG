@@ -1,0 +1,16 @@
+{
+  "timestamp": "20251024_181840",
+  "start_time": "2025-10-24T18:14:34.579764",
+  "end_time": "2025-10-24T18:18:40.520496",
+  "sample_rate": 100,
+  "total_samples": 6000,
+  "duration_seconds": 60,
+  "device_name": "ESP32-PPG-Glucose",
+  "signal_stats": {
+    "mean": 23010.088,
+    "std": 820.403739786698,
+    "min": 19852.0,
+    "max": 25944.0,
+    "median": 23012.0
+  }
+}

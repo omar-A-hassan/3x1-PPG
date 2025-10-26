@@ -17,6 +17,8 @@ from datetime import datetime
 from pathlib import Path
 import json
 import csv
+from fastapi.responses import FileResponse
+import os
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -25,7 +27,8 @@ app = FastAPI(title="WebSocket Receiver Service")
 
 # Configuration
 ESP32_DEVICE_NAME = "ESP32-PPG-Glucose"
-PREPROCESSING_SERVICE_URL = "http://preprocessing:8001"
+PREPROCESSING_SERVICE_URL = os.getenv("PREPROCESSING_SERVICE_URL", "http://localhost:8001")
+UI_SERVICE_URL = os.getenv("UI_SERVICE_URL", "http://localhost:8003")
 TOTAL_SAMPLES = 6000  # Total samples to collect
 
 # Data storage configuration
@@ -54,6 +57,35 @@ collection_metadata = {
 
 state_lock = threading.Lock()
 
+
+async def post_with_retry(client: httpx.AsyncClient, url: str, json=None, retries: int = 3, backoff: float = 1.0):
+    """Helper: POST with retries and exponential backoff.
+
+    Raises the last exception if all retries fail.
+    Returns the httpx.Response on success.
+    """
+    last_exc = None
+    for attempt in range(1, retries + 1):
+        try:
+            logger.info(f"POST attempt {attempt}/{retries} -> {url}")
+            resp = await client.post(url, json=json)
+            return resp
+        except httpx.RequestError as re:
+            last_exc = re
+            logger.warning(f"POST attempt {attempt} failed: {re}")
+            if attempt < retries:
+                sleep_for = backoff * (2 ** (attempt - 1))
+                logger.info(f"Retrying after {sleep_for:.1f}s...")
+                await asyncio.sleep(sleep_for)
+            else:
+                logger.error(f"All {retries} POST attempts failed for {url}")
+                raise
+        except Exception as e:
+            last_exc = e
+            logger.exception(f"Unexpected error during POST attempt {attempt}: {e}")
+            raise
+
+
 class CollectionRequest(BaseModel):
     action: str
 
@@ -65,9 +97,28 @@ class CollectionStatus(BaseModel):
 
 @app.on_event("startup")
 async def _startup():
+    """
+    Startup: capture event loop and try automatic ESP32 connection.
+    """
     global main_event_loop
     main_event_loop = asyncio.get_event_loop()
-    logger.info("Startup: captured event loop for thread callbacks")
+    logger.info("[Startup] Captured event loop for thread callbacks")
+
+    ws_url = "ws://192.168.4.1:81/"
+    max_retries = 5
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            logger.info(f"[Auto-Connect] Attempt {attempt} to connect to ESP32 at {ws_url}")
+            _start_ws_thread(ws_url)
+            await asyncio.sleep(2.0)  # give connection time
+            logger.info(f"[Auto-Connect] Thread started (attempt {attempt})")
+            break
+        except Exception as e:
+            logger.warning(f"[Auto-Connect] Attempt {attempt} failed: {e}")
+            await asyncio.sleep(3)
+    else:
+        logger.error(f"[Auto-Connect] All {max_retries} attempts failed.")
 
 @app.get("/")
 async def root():
@@ -411,11 +462,12 @@ async def save_ppg_data(ppg_signal: np.ndarray) -> dict:
 
 async def save_and_process_data():
     """
-    New workflow:
-    1. Convert buffer to numpy array
-    2. Unscale data
-    3. SAVE data to disk (multiple formats)
-    4. Send to preprocessing service
+    Complete workflow with UI update:
+    1. Convert & unscale
+    2. SAVE data to disk
+    3. Send to preprocessing service
+    4. Get result from preprocessing
+    5. Send result to UI service ← NEW STEP
     """
     global ppg_buffer, collection_status
 
@@ -428,53 +480,111 @@ async def save_and_process_data():
         
         # Step 2: Unscale data (ESP32 divided by 4)
         ppg_signal = ppg_signal * 4
-        logger.info(f"Unscaled data (×4): mean={ppg_signal.mean():.2f}, std={ppg_signal.std():.2f}")
+        logger.info(f"Unscaled data: mean={ppg_signal.mean():.2f}, std={ppg_signal.std():.2f}")
         
-        # Step 3: SAVE DATA TO DISK (NEW STEP)
+        # Step 3: SAVE DATA TO DISK
         logger.info("=" * 60)
         logger.info("SAVING PPG DATA TO DISK")
         logger.info("=" * 60)
         
         save_result = await save_ppg_data(ppg_signal)
         
+        csv_file_path = None
+        
         if save_result["success"]:
             logger.info(f"✓ Data saved successfully!")
-            logger.info(f"✓ Files created: {len(save_result['files'])}")
+            # Get CSV file path
+            csv_file_path = save_result['files'].get('csv')
+            logger.info(f"✓ CSV saved at: {csv_file_path}")
             for format_name, file_path in save_result['files'].items():
                 logger.info(f"  - {format_name.upper()}: {file_path}")
         else:
             logger.error(f"✗ Failed to save data: {save_result.get('error')}")
-            # Continue to preprocessing even if save fails
         
         logger.info("=" * 60)
         
-        # Step 4: Send to preprocessing service
+        # Step 4: Send to preprocessing service (with retries)
         logger.info("Sending data to preprocessing service...")
-        
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(
-                f"{PREPROCESSING_SERVICE_URL}/preprocess",
-                json={"signal": ppg_signal.tolist()}
-            )
 
-            if response.status_code == 200:
-                result = response.json()
-                logger.info(f"✓ Preprocessing complete: {result.get('num_segments')} segments")
-                
-                with state_lock:
-                    collection_status = "COMPLETE"
-                
-                return {
-                    "preprocessing": result,
-                    "saved_data": save_result
+        preprocessing_result = None
+        async with httpx.AsyncClient(timeout=60.0) as client:
+                try:
+                    preprocessing_response = await post_with_retry(
+                        client,
+                        f"{PREPROCESSING_SERVICE_URL}/preprocess",
+                        json={"signal": ppg_signal.tolist()},
+                        retries=3,
+                        backoff=1.0,
+                    )
+                except Exception as e:
+                    logger.error(f"Preprocessing request failed after retries: {e}")
+                    preprocessing_response = None
+
+                if preprocessing_response is not None and preprocessing_response.status_code == 200:
+                    result = preprocessing_response.json()
+                    logger.info(f"✓ Preprocessing complete: {result.get('num_segments')} segments")
+                    preprocessing_result = result
+                else:
+                    if preprocessing_response is None:
+                        logger.error("Preprocessing service unreachable or failed after retries")
+                    else:
+                        logger.error(f"Preprocessing returned status {preprocessing_response.status_code}: {preprocessing_response.text}")
+
+                # Prepare UI payload; do not use fallback glucose to avoid overwriting model's value
+                num_segments = preprocessing_result.get('num_segments', 0) if preprocessing_result else 0
+                quality_score = preprocessing_result.get('quality_score', 0.0) if preprocessing_result else 0.0
+                glucose_prediction = None  # No fallback; will be updated by model service
+
+                logger.info("=" * 60)
+                logger.info("SENDING RESULTS TO UI SERVICE (best-effort)")
+                logger.info("=" * 60)
+
+                ui_payload = {
+                    "glucose": glucose_prediction,
+                    "num_segments": num_segments,
+                    "quality_score": quality_score,
+                    "device": "ESP32-PPG-Glucose",
+                    "csv_file": csv_file_path,
+                    "preprocessing_ok": bool(preprocessing_result)
                 }
-            else:
-                logger.error(f"✗ Preprocessing failed: {response.text}")
+
+                try:
+                    # Use the same client and retry helper for UI notifications
+                    try:
+                        ui_response = await post_with_retry(
+                            client,
+                            f"{UI_SERVICE_URL}/update_result",
+                            json=ui_payload,
+                            retries=2,
+                            backoff=0.5,
+                        )
+                    except Exception as uie:
+                        logger.error(f"Failed to notify UI after retries: {uie}")
+                        ui_response = None
+
+                    if ui_response is not None and ui_response.status_code == 200:
+                        logger.info("✓ Results sent to UI service successfully")
+                        if glucose_prediction is not None:
+                            logger.info(f"  - Glucose: {float(glucose_prediction):.1f} mg/dL")
+                        else:
+                            logger.info("  - Glucose: None (waiting for model)")
+                        logger.info(f"  - Segments: {num_segments}")
+                        logger.info(f"  - Quality: {quality_score:.2%}")
+                        logger.info(f"  - CSV File: {csv_file_path}")
+                    else:
+                        logger.warning("UI service update did not succeed or returned non-200 status")
+
+                except Exception as ui_error:
+                    logger.exception(f"Unexpected error sending to UI service: {ui_error}")
+
                 with state_lock:
-                    collection_status = "ERROR"
+                    collection_status = "COMPLETE" if preprocessing_result else "COMPLETE_WITH_WARNINGS"
+
                 return {
-                    "preprocessing": None,
-                    "saved_data": save_result
+                    "preprocessing": preprocessing_result,
+                    "saved_data": save_result,
+                    "csv_file": csv_file_path,
+                    "glucose": glucose_prediction
                 }
 
     except Exception as e:
@@ -554,11 +664,12 @@ async def list_saved_data():
         raise HTTPException(status_code=500, detail=str(e))
 
 
+
 # ============================================================================
 # NEW ENDPOINT: Download Specific File
 # ============================================================================
 
-from fastapi.responses import FileResponse
+
 
 @app.get("/download/{filename}")
 async def download_file(filename: str):

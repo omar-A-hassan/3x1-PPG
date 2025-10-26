@@ -23,8 +23,10 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Model Service")
+app = FastAPI(title="Model Service")
 
-UI_SERVICE_URL = "http://ui:8003"
+# UI callback endpoint (env override for local runs)
+UI_SERVICE_URL = os.getenv("UI_SERVICE_URL", "http://localhost:8003")
 
 # Add project root to path
 PROJECT_ROOT = Path(__file__).parent.parent.parent

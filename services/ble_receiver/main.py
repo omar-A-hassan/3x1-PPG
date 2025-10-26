@@ -11,6 +11,7 @@ import numpy as np
 from bleak import BleakClient, BleakScanner
 import struct
 import logging
+import os
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -24,7 +25,7 @@ DATA_CHAR_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 STATUS_CHAR_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a9"
 CONTROL_CHAR_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26aa"
 
-PREPROCESSING_SERVICE_URL = "http://preprocessing:8001"
+PREPROCESSING_SERVICE_URL = os.getenv("PREPROCESSING_SERVICE_URL", "http://localhost:8001")
 TOTAL_SAMPLES = 6000
 
 # Global state
