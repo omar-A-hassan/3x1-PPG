@@ -26,6 +26,12 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="UI Service")
 
+# ============================================================================
+# DEBUG/DEPLOYMENT CONFIGURATION
+# ============================================================================
+ENABLE_CSV_FALLBACK = False  # Download CSV if raw_signal missing from response
+# ============================================================================
+
 # Service URLs (configurable via environment variables)
 # When running locally set RECEIVER_SERVICE_URL=http://localhost:8000
 # When running under docker-compose set RECEIVER_SERVICE_URL=http://ble_receiver:8000
@@ -41,7 +47,7 @@ class UpdateResultRequest(BaseModel):
     num_segments: int
     quality_score: float
     device: str
-    csv_file: Optional[str] = None  # NEW: Path to saved CSV
+    csv_file: Optional[str] = None  # Path to saved CSV
     # Respiratory metrics (optional)
     resp_rate_bpm: Optional[float] = None
     resp_freq_hz: Optional[float] = None
@@ -49,6 +55,12 @@ class UpdateResultRequest(BaseModel):
     entropy: Optional[float] = None
     peaks_count: Optional[int] = None
     method_used: Optional[str] = None
+    # NEW: Raw signal and timestamps for in-memory plotting
+    raw_signal: Optional[List[float]] = None
+    timestamps_ms: Optional[List[float]] = None
+    # PSD arrays for respiratory plot
+    freqs: Optional[List[float]] = None
+    psd: Optional[List[float]] = None
 
 
 class ResultState:
@@ -67,7 +79,11 @@ class ResultState:
                esqi: Optional[float] = None,
                entropy: Optional[float] = None,
                peaks_count: Optional[int] = None,
-               method_used: Optional[str] = None):
+               method_used: Optional[str] = None,
+               raw_signal: Optional[List[float]] = None,
+               timestamps_ms: Optional[List[float]] = None,
+               freqs: Optional[List[float]] = None,
+               psd: Optional[List[float]] = None):
         with self.lock:
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             # Preserve previous glucose value if not provided (avoid overwriting model result)
@@ -79,13 +95,17 @@ class ResultState:
                 "num_segments": num_segments,
                 "quality_score": quality_score,
                 "device": device,
-                "csv_file": csv_file,  # NEW
+                "csv_file": csv_file,
                 "resp_rate_bpm": resp_rate_bpm,
                 "resp_freq_hz": resp_freq_hz,
                 "esqi": esqi,
                 "entropy": entropy,
                 "peaks_count": peaks_count,
                 "method_used": method_used,
+                "raw_signal": raw_signal,
+                "timestamps_ms": timestamps_ms,
+                "freqs": freqs,
+                "psd": psd,
             }
             self.latest_result = result
             self.latest_csv_file = csv_file  # NEW
@@ -120,7 +140,7 @@ result_state = ResultState()
 async def update_result(request: UpdateResultRequest):
     """
     Receiver service calls this after processing complete
-    Now includes csv_file path and optional respiratory metrics
+    Now includes csv_file path, optional respiratory metrics, and in-memory signal/PSD data
     """
     try:
         result_state.update(
@@ -128,42 +148,51 @@ async def update_result(request: UpdateResultRequest):
             request.num_segments,
             request.quality_score,
             request.device,
-            request.csv_file,  # NEW
+            request.csv_file,
             request.resp_rate_bpm,
             request.resp_freq_hz,
             request.esqi,
             request.entropy,
             request.peaks_count,
             request.method_used,
+            request.raw_signal,
+            request.timestamps_ms,
+            request.freqs,
+            request.psd,
         )
         # Best-effort: if a CSV path was provided but the UI can't access it locally,
         # attempt to download it from the receiver service using the filename.
+        # Only try if download endpoints are likely enabled (check for file existence first)
         if request.csv_file:
             try:
                 csv_path = Path(request.csv_file)
                 if not csv_path.exists():
-                    filename = csv_path.name
-                    download_url = f"{RECEIVER_SERVICE_URL}/download/{filename}"
-                    logger.info(f"CSV not found locally, attempting to download from receiver: {download_url}")
-                    async with httpx.AsyncClient(timeout=30.0) as client:
-                        resp = await client.get(download_url)
-                        if resp.status_code == 200:
-                            PPG_DATA_DIR.mkdir(parents=True, exist_ok=True)
-                            dest = PPG_DATA_DIR / filename
-                            with open(dest, "wb") as f:
-                                f.write(resp.content)
-                            # Update stored latest CSV path in a thread-safe way
-                            with result_state.lock:
-                                result_state.latest_csv_file = str(dest)
-                            logger.info(f"Downloaded CSV from receiver to {dest}")
-                        else:
-                            logger.warning(f"Failed to download CSV from receiver: {resp.status_code} {resp.text}")
+                    # File doesn't exist locally - only attempt download if we suspect endpoints are enabled
+                    # To avoid 404 errors, we skip download if ENABLE_DOWNLOAD_ENDPOINTS is known to be False
+                    # For now, log the missing file but don't attempt download
+                    logger.info(f"CSV file not found locally: {csv_path}. Skipping download (receiver may have downloads disabled).")
+                    # If you enable receiver download endpoints, uncomment the code below:
+                    # filename = csv_path.name
+                    # download_url = f"{RECEIVER_SERVICE_URL}/download/{filename}"
+                    # logger.info(f"Attempting to download from receiver: {download_url}")
+                    # async with httpx.AsyncClient(timeout=30.0) as client:
+                    #     resp = await client.get(download_url)
+                    #     if resp.status_code == 200:
+                    #         PPG_DATA_DIR.mkdir(parents=True, exist_ok=True)
+                    #         dest = PPG_DATA_DIR / filename
+                    #         with open(dest, "wb") as f:
+                    #             f.write(resp.content)
+                    #         with result_state.lock:
+                    #             result_state.latest_csv_file = str(dest)
+                    #         logger.info(f"Downloaded CSV from receiver to {dest}")
+                    #     else:
+                    #         logger.warning(f"Failed to download CSV: {resp.status_code}")
                 else:
                     # Path exists locally on UI host — store normalized path
                     with result_state.lock:
                         result_state.latest_csv_file = str(csv_path)
             except Exception as e:
-                logger.warning(f"Error while trying to obtain CSV file for plotting: {e}")
+                logger.warning(f"Error while checking CSV file for plotting: {e}")
         return {"status": "success"}
     except Exception as e:
         logger.error(f"Failed to update result: {e}")
@@ -341,7 +370,10 @@ def create_overview_plot(timestamps, ir_values):
         ax.plot(timestamps, ir_values, linewidth=0.5, alpha=0.8, color='blue')
         ax.set_xlabel('Time (seconds)', fontsize=11)
         ax.set_ylabel('IR Value', fontsize=11)
-        ax.set_title('Complete PPG Signal (60 seconds)', fontsize=12, fontweight='bold')
+        
+        # Dynamic title based on actual duration
+        duration = timestamps[-1] - timestamps[0] if len(timestamps) > 0 else 0
+        ax.set_title(f'Complete PPG Signal ({duration:.0f} seconds)', fontsize=12, fontweight='bold')
         ax.grid(True, alpha=0.3)
         
         # Add statistics box
@@ -495,8 +527,13 @@ def create_gradio_interface():
             return "No history yet"
         lines = ["### Recent Predictions:\n"]
         for r in reversed(history[-10:]):
+            glucose_val = r.get('glucose')
+            if glucose_val is not None:
+                glucose_str = f"{glucose_val:.1f} mg/dL"
+            else:
+                glucose_str = "N/A"
             lines.append(
-                f"- **{r['timestamp']}**: {r['glucose']:.1f} mg/dL "
+                f"- **{r['timestamp']}**: {glucose_str} "
                 f"(Quality: {r['quality_score']:.1%}, Segments: {r['num_segments']})"
             )
         return "\n".join(lines)
@@ -508,11 +545,18 @@ def create_gradio_interface():
             if len(history) < 2:
                 return create_placeholder_figure("Not enough history to plot")
             
-            glucose_values = [r['glucose'] for r in history]
+            # Filter out None glucose values
+            valid_history = [(i, r['glucose']) for i, r in enumerate(history) if r.get('glucose') is not None]
+            
+            if len(valid_history) < 2:
+                return create_placeholder_figure("Not enough valid glucose readings to plot")
+            
+            indices, glucose_values = zip(*valid_history)
+            
             fig = Figure(figsize=(10, 5))
             ax = fig.add_subplot(111)
             
-            ax.plot(range(len(glucose_values)), glucose_values, 'bo-', 
+            ax.plot(indices, glucose_values, 'bo-', 
                    linewidth=2, markersize=8)
             ax.axhline(y=70, color='r', linestyle='--', label='Low threshold')
             ax.axhline(y=140, color='g', linestyle='--', label='Normal threshold')
@@ -530,22 +574,38 @@ def create_gradio_interface():
             return create_placeholder_figure("Failed to generate history plot")
 
     def generate_signal_plots():
-        csv_file = result_state.get_latest_csv()
-        # If there's no CSV available, return placeholder figures for all plot outputs
-        if not csv_file or not Path(csv_file).exists():
+        result = result_state.get_latest()
+        
+        # Try to use in-memory data first
+        timestamps = None
+        ir_values = None
+        data_source = None
+        
+        if result and result.get("raw_signal") is not None and result.get("timestamps_ms") is not None:
+            # Use in-memory data
+            ir_values = np.array(result["raw_signal"])
+            timestamps = np.array(result["timestamps_ms"]) / 1000.0  # Convert ms to seconds
+            data_source = "in-memory"
+            logger.info("Using in-memory raw signal for plotting")
+        elif ENABLE_CSV_FALLBACK:
+            # Fallback to CSV file
+            csv_file = result_state.get_latest_csv()
+            if csv_file and Path(csv_file).exists():
+                timestamps, ir_values = load_ppg_from_csv(Path(csv_file))
+                if timestamps is not None:
+                    data_source = f"CSV ({Path(csv_file).name})"
+                    logger.info(f"Using CSV fallback for plotting: {csv_file}")
+        
+        # If no data available, return placeholders
+        if timestamps is None or ir_values is None:
             placeholders = [create_placeholder_figure("No data available")] * 9
-            return (*placeholders, "⚠️ No data file available. Please complete a collection first.")
+            return (*placeholders, "⚠️ No data available. Please complete a collection first.")
 
-        timestamps, ir_values = load_ppg_from_csv(Path(csv_file))
-        if timestamps is None:
-            placeholders = [create_placeholder_figure("Failed to load data")] * 9
-            return (*placeholders, "⚠️ Failed to load data")
-
-    # Create plots
+        # Create plots
         overview = create_overview_plot(timestamps, ir_values)
         segments = create_segment_plots(timestamps, ir_values, segment_length=10.0)
 
-    # Pad segments to 6 items with placeholder figures
+        # Pad segments to 6 items with placeholder figures
         while len(segments) < 6:
             segments.append(create_placeholder_figure("No segment data"))
         segments = segments[:6]
@@ -557,7 +617,7 @@ def create_gradio_interface():
         spectrum = create_spectrum_plot(ir_values, fs=int(fs)) or create_placeholder_figure("No spectrum")
         spectrogram = create_spectrogram_plot(ir_values, fs=int(fs)) or create_placeholder_figure("No spectrogram")
 
-        status_msg = f"✅ Generated plots from {Path(csv_file).name} (fs≈{int(fs)} Hz)"
+        status_msg = f"✅ Generated plots from {data_source} (fs≈{int(fs)} Hz)"
 
         # **Unpack segments list into individual outputs**
         return (overview, *segments, spectrum, spectrogram, status_msg)
@@ -597,6 +657,10 @@ def create_gradio_interface():
                 entropy=resp_data.get("entropy"),
                 peaks_count=resp_data.get("peaks_count"),
                 method_used=resp_data.get("method_used"),
+                raw_signal=result.get("raw_signal"),
+                timestamps_ms=result.get("timestamps_ms"),
+                freqs=resp_data.get("freqs"),
+                psd=resp_data.get("psd"),
             )
         
         # Create PSD plot
@@ -621,6 +685,49 @@ def create_gradio_interface():
 """
         
         return (status, psd_plot)
+
+    def refresh_respiratory_display():
+        """Display respiratory PSD from in-memory data (if available)"""
+        result = result_state.get_latest()
+        
+        if not result:
+            return ("⚠️ No results available", create_placeholder_figure("No data available"))
+        
+        # Check if we have in-memory PSD data
+        freqs = result.get("freqs")
+        psd = result.get("psd")
+        resp_freq_hz = result.get("resp_freq_hz")
+        
+        if freqs is not None and psd is not None:
+            # Convert lists to numpy arrays for plotting
+            freqs_arr = np.array(freqs)
+            psd_arr = np.array(psd)
+            psd_plot = create_respiratory_psd_plot(freqs_arr, psd_arr, resp_freq_hz)
+            
+            # Build status message
+            resp_rate_bpm = result.get("resp_rate_bpm")
+            esqi = result.get("esqi")
+            entropy = result.get("entropy")
+            peaks_count = result.get("peaks_count")
+            method_used = result.get("method_used")
+            
+            if resp_rate_bpm is not None:
+                status = f"""
+✅ **Respiratory Metrics (from latest result)**
+
+**Rate:** {resp_rate_bpm:.1f} breaths/min  
+**Frequency:** {resp_freq_hz:.3f} Hz  
+**ESQI:** {esqi:.3f}  
+**Entropy:** {entropy:.3f}  
+**Peaks:** {peaks_count}  
+**Method:** {method_used}
+"""
+            else:
+                status = "ℹ️ Respiratory data available (PSD plot shown)"
+            
+            return (status, psd_plot)
+        else:
+            return ("⚠️ No respiratory analysis data available", create_placeholder_figure("No PSD data"))
 
     # ========================================================================
     # BUILD GRADIO INTERFACE
@@ -685,7 +792,7 @@ def create_gradio_interface():
         
         with gr.Tab("📈 Signal Analysis"):
             gr.Markdown("## Raw PPG Signal Visualization")
-            gr.Markdown("View time-domain and frequency-domain analysis of collected data")
+            gr.Markdown("View time-domain and frequency-domain analysis of collected data (90 seconds)")
             
             with gr.Row():
                 plot_btn = gr.Button("🔄 Generate Plots", variant="primary", size="lg")
@@ -693,7 +800,7 @@ def create_gradio_interface():
             plot_status = gr.Markdown("Click 'Generate Plots' to visualize the latest collection")
             
             gr.Markdown("---")
-            gr.Markdown("### Complete Signal Overview (60 seconds)")
+            gr.Markdown("### Complete Signal Overview")
             overview_plot = gr.Plot(label="Full PPG Signal")
             
             gr.Markdown("---")
@@ -746,16 +853,23 @@ def create_gradio_interface():
             gr.Markdown("Analyze inter-beat intervals using Welch's method to estimate respiratory rate")
             
             with gr.Row():
-                compute_resp_btn = gr.Button("🔬 Compute Respiratory Rate", variant="primary", size="lg")
+                refresh_resp_btn = gr.Button("🔄 Refresh Display", variant="secondary", size="lg")
+                compute_resp_btn = gr.Button("🔬 Re-compute Respiratory", variant="primary", size="lg")
             
-            resp_status = gr.Markdown("Click 'Compute Respiratory Rate' to analyze the latest collection")
+            resp_status = gr.Markdown("Click 'Refresh Display' to show latest results or 'Re-compute' to reanalyze from CSV")
             
             gr.Markdown("---")
             gr.Markdown("### Respiratory PSD Analysis")
             
             respiratory_psd_plot = gr.Plot(label="Respiratory Power Spectral Density")
             
-            # Respiratory computation binding
+            # Respiratory refresh binding (uses in-memory data)
+            refresh_resp_btn.click(
+                fn=refresh_respiratory_display,
+                outputs=[resp_status, respiratory_psd_plot]
+            )
+            
+            # Respiratory re-computation binding (recomputes from CSV)
             compute_resp_btn.click(
                 fn=compute_respiratory_sync,
                 outputs=[resp_status, respiratory_psd_plot]

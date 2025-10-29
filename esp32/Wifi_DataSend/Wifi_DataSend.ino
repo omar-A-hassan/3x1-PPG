@@ -24,9 +24,9 @@
 #define I2C_SDA 21
 #define I2C_SCL 22
 
-#define SAMPLING_RATE 100
-#define COLLECTION_TIME 60
-#define TOTAL_SAMPLES (SAMPLING_RATE * COLLECTION_TIME)  
+#define SAMPLING_RATE 100  // True 100 Hz for better glucose segmentation
+#define COLLECTION_TIME 90  // 90 seconds for 9000 samples
+#define TOTAL_SAMPLES 9000  // Fixed target: 9000 samples
 #define SAMPLE_INTERVAL_MS (1000 / SAMPLING_RATE)
 
 // WiFi Configuration (Choose one)
@@ -38,7 +38,8 @@
 
 // If WIFI_MODE = 1: ESP32 acts as Access Point
 #define AP_SSID "ESP32-PPG-Glucose"
-#define AP_PASS "ESP32gluco123"
+// For initial bring-up, use OPEN AP to avoid CCMP replay issues
+// #define AP_PASS "ESP32gluco123"
 
 #define WEBSERVER_PORT 80
 #define WEBSOCKET_PORT 81
@@ -60,7 +61,18 @@ IPAddress local_IP(192,168,4,1);
 // Data storage
 uint16_t ppgBuffer[TOTAL_SAMPLES];
 uint32_t sampleIndex = 0;
-unsigned long lastSampleTime = 0;
+unsigned long lastSampleTime = 0; // legacy; not used with timer
+
+// esp_timer for precise sampling (ESP-IDF native timer API)
+esp_timer_handle_t sampleTimer = NULL;
+volatile bool sampleFlag = false;
+volatile uint32_t isrTickCount = 0;
+volatile uint64_t timerStartMicros = 0;  // Track actual start time for duration
+
+void IRAM_ATTR onSampleTimer(void* arg) {
+  sampleFlag = true;
+  isrTickCount++;
+}
 
 // State machine
 enum State {
@@ -105,7 +117,9 @@ void initWiFi() {
     WiFi.mode(WIFI_AP);
     WiFi.mode(WIFI_AP);
     WiFi.softAPConfig(local_IP, local_IP, IPAddress(255,255,255,0)); // gateway, subnet
-    WiFi.softAP(AP_SSID, AP_PASS,6,false);
+    // Open AP to reduce WPA2/CCMP issues during testing
+    // WiFi.softAP(AP_SSID, AP_PASS,6,false);
+    WiFi.softAP(AP_SSID);
     
     IPAddress apIP = WiFi.softAPIP();
     Serial.println("Access Point started!");
@@ -170,6 +184,10 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
               Serial.println("Command: CANCEL");
               currentState = IDLE;
               sampleIndex = 0;
+              // Stop timer if active
+              if (sampleTimer) {
+                esp_timer_stop(sampleTimer);
+              }
               sendStatus("CANCELLED");
               break;
               
@@ -178,6 +196,10 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
               currentState = IDLE;
               sampleIndex = 0;
               samplesCollected = 0;
+              // Stop timer if active
+              if (sampleTimer) {
+                esp_timer_stop(sampleTimer);
+              }
               sendStatus("RESET");
               break;
               
@@ -234,20 +256,21 @@ void setup() {
   }
   Serial.println("MAX30102 initialized");
 
-  // Configure MAX30102
-  byte ledBrightness = 0x1F;
-  byte sampleAverage = 4;
-  byte ledMode = 2;
-  int sampleRate = 100;
-  int pulseWidth = 411;
-  int adcRange = 16384;
+  // Configure MAX30102 for optimal signal quality at 100 Hz
+  // Config C: sampleRate=400 Hz, sampleAverage=4 → 100 Hz output (better for glucose segmentation)
+  byte ledBrightness = 0x1F;   // Options: 0=Off to 255=50mA
+  byte sampleAverage = 4;      // Hardware averaging: 4 samples @ 400 Hz → 100 Hz output (~6dB SNR)
+  byte ledMode = 2;            // Red + IR mode
+  int sampleRate = 400;        // Sensor ADC samples at 400 Hz, averages to 100 Hz
+  int pulseWidth = 411;        // 411 µs LED pulse (good SNR without saturation)
+  int adcRange = 16384;        // 16-bit ADC range
 
   particleSensor.setup(ledBrightness, sampleAverage, ledMode, sampleRate, pulseWidth, adcRange);
   particleSensor.setPulseAmplitudeRed(0x0A);
   particleSensor.setPulseAmplitudeIR(0x1F);
   particleSensor.clearFIFO();
 
-  Serial.println("Sensor configured for 100 Hz");
+  Serial.println("Sensor configured: 400 Hz ADC → 4× averaging → 100 Hz output (Config C - Glucose Optimized)");
 
   // Initialize WiFi
   initWiFi();
@@ -259,6 +282,20 @@ void setup() {
 
   Serial.println("\nReady! Waiting for client connection...");
   Serial.println("State: IDLE");
+
+  // Create esp_timer for 100 Hz sampling (10 ms period = 10,000 µs)
+  const esp_timer_create_args_t timer_args = {
+    .callback = &onSampleTimer,
+    .arg = NULL,
+    .dispatch_method = ESP_TIMER_TASK,
+    .name = "sample_timer"
+  };
+  esp_err_t err = esp_timer_create(&timer_args, &sampleTimer);
+  if (err != ESP_OK) {
+    Serial.printf("ERROR: Failed to create esp_timer: %d\n", err);
+  } else {
+    Serial.println("esp_timer created successfully (100 Hz = 10ms period, will start on finger detect)");
+  }
 }
 
 // ---------- MAIN LOOP ----------
@@ -306,6 +343,14 @@ void handleWaitingForFinger() {
     samplesCollected = 0;
     poorQualitySamples = 0;
     lastSampleTime = millis();
+    // Start esp_timer for precise 100 Hz sampling
+    sampleFlag = false;
+    isrTickCount = 0;
+    if (sampleTimer) {
+      timerStartMicros = esp_timer_get_time();  // Record start in microseconds
+      esp_timer_start_periodic(sampleTimer, 10000);  // 10,000 µs = 10 ms = 100 Hz
+      Serial.println("[Diag] esp_timer started (100 Hz periodic)");
+    }
   } else {
     static unsigned long lastStatusTime = 0;
     if (millis() - lastStatusTime > 1000) {
@@ -323,56 +368,70 @@ void handleWaitingForFinger() {
 }
 
 void handleCollecting() {
-  unsigned long currentTime = millis();
+  // Use esp_timer-driven flag to trigger sampling at precise intervals
+  bool doSample = false;
+  if (sampleFlag) {
+    sampleFlag = false;
+    doSample = true;
+  }
 
-  if (currentTime - lastSampleTime >= SAMPLE_INTERVAL_MS) {
-    lastSampleTime = currentTime;
+  // Periodic diagnostics to Serial ONLY (no WebSocket overhead)
+  static unsigned long lastDiag = 0;
+  static uint32_t lastTickCount = 0;
+  unsigned long now = millis();
+  if (now - lastDiag >= 1000) {
+    uint32_t ticks = isrTickCount;
+    uint32_t delta = ticks - lastTickCount;
+    lastTickCount = ticks;
+    lastDiag = now;
+    
+    // Show elapsed time and effective rate from esp_timer
+    uint64_t nowMicros = esp_timer_get_time();
+    float elapsedSec = (nowMicros - timerStartMicros) / 1000000.0;
+    float effectiveRate = sampleIndex > 0 ? sampleIndex / elapsedSec : 0.0;
+    float progress = (float)sampleIndex / TOTAL_SAMPLES * 100.0;
+    
+    Serial.printf("[Diag] ISR: %u ticks/s | Samples: %u/%u (%.1f%%) | Elapsed: %.2fs | Rate: %.2f Hz\n", 
+                  delta, sampleIndex, TOTAL_SAMPLES, progress, elapsedSec, effectiveRate);
+    
+    // Warn if timer appears stalled
+    if (delta == 0) {
+      Serial.println("[WARNING] No ISR ticks in last second - timer may be stalled!");
+    }
+  }
 
+  if (doSample) {
+    // Read sensor value
     uint32_t irValue = particleSensor.getIR();
 
+    // Quality tracking (statistics only, no output)
     bool goodQuality = (irValue > MIN_IR_THRESHOLD && irValue < MAX_IR_THRESHOLD);
     if (!goodQuality) {
       poorQualitySamples++;
-
-      if (poorQualitySamples > 100) {
-        Serial.println("ERROR: Poor signal quality - collection aborted");
-        sendStatus("ERROR_QUALITY");
-        currentState = IDLE;
-        return;
-      }
     }
 
+    // Store sample (downscale from 18-bit to 16-bit)
     ppgBuffer[sampleIndex] = (uint16_t)(irValue >> 2);
     sampleIndex++;
     samplesCollected++;
 
-    // Progress updates every 10 samples
-    if (sampleIndex % 10 == 0) {
-      float progress = (float)sampleIndex / TOTAL_SAMPLES * 100.0;
-      
-      // Send progress as JSON
-      StaticJsonDocument<128> doc;
-      doc["event"] = "progress";
-      doc["progress"] = progress;
-      doc["samples"] = sampleIndex;
-      
-      String jsonStr;
-      serializeJson(doc, jsonStr);
-      webSocket.sendTXT(connectedClientNum, jsonStr);
-
-      if (sampleIndex % 100 == 0) {
-        Serial.printf("Progress: %.1f%% (%d/%d samples)\n", progress, sampleIndex, TOTAL_SAMPLES);
-      }
-    }
+    // NO PROGRESS UPDATES - Removed to maximize sampling rate
+    // Previously sent JSON every 10 samples, causing ~30-40ms overhead per iteration
+    // Now the loop can run at nearly 100 Hz without WebSocket transmission blocking
 
     // Check if collection complete
     if (sampleIndex >= TOTAL_SAMPLES) {
-      unsigned long collectionDuration = millis() - collectionStartTime;
-      float actualRate = (float)samplesCollected / (collectionDuration / 1000.0);
+      // Stop timer and compute precise duration from esp_timer
+      if (sampleTimer) {
+        esp_timer_stop(sampleTimer);
+      }
+      uint64_t endMicros = esp_timer_get_time();
+      float collectionDuration = (endMicros - timerStartMicros) / 1000000.0;  // seconds
+      float actualRate = (float)samplesCollected / collectionDuration;
 
       Serial.println("\n=== Collection Complete ===");
       Serial.printf("Samples collected: %d\n", samplesCollected);
-      Serial.printf("Duration: %.2f seconds\n", collectionDuration / 1000.0);
+      Serial.printf("Duration: %.2f seconds\n", collectionDuration);
       Serial.printf("Actual rate: %.2f Hz\n", actualRate);
       Serial.printf("Poor quality samples: %d (%.2f%%)\n",
                     poorQualitySamples,
@@ -383,6 +442,10 @@ void handleCollecting() {
       currentState = TRANSMITTING;
     }
   }
+
+  // Minimal yield to WiFi stack (required to prevent watchdog timeout)
+  // delay(0) calls yield() internally - sufficient for WiFi keepalive
+  delay(0);
 }
 
 void handleTransmitting() {

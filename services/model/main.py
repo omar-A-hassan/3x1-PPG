@@ -306,28 +306,7 @@ async def predict(request: PredictRequest):
             logger.error(f"Prediction failed: {pred_error}", exc_info=True)
             raise HTTPException(status_code=500, detail=f"Prediction failed: {str(pred_error)}")
 
-        # Send to UI service
-        logger.info("Sending result to UI service...")
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                ui_response = await client.post(
-                    f"{UI_SERVICE_URL}/update_result",
-                    json={
-                        "glucose": glucose_pred,
-                        "num_segments": len(segments),
-                        "quality_score": request.quality_score,
-                        "device": str(model_inference.device)
-                    }
-                )
-                
-                if ui_response.status_code != 200:
-                    logger.warning(f"UI service update failed: {ui_response.text}")
-                else:
-                    logger.info("Successfully sent result to UI")
-                    
-        except Exception as e:
-            logger.warning(f"Failed to send to UI service: {e}")
-        
+        # Return prediction result (Preprocessing will aggregate and send to UI)
         return PredictResponse(
             success=True,
             glucose_prediction=glucose_pred,

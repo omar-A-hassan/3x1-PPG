@@ -25,11 +25,18 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="WebSocket Receiver Service")
 
+# ============================================================================
+# DEBUG/DEPLOYMENT CONFIGURATION
+# ============================================================================
+ENABLE_CSV_SAVE = False          # Save all 5 formats to disk (archival)
+ENABLE_DOWNLOAD_ENDPOINTS = False  # Expose /download and /saved_data endpoints
+# ============================================================================
+
 # Configuration
 ESP32_DEVICE_NAME = "ESP32-PPG-Glucose"
 PREPROCESSING_SERVICE_URL = os.getenv("PREPROCESSING_SERVICE_URL", "http://localhost:8001")
 UI_SERVICE_URL = os.getenv("UI_SERVICE_URL", "http://localhost:8003")
-TOTAL_SAMPLES = 6000  # Total samples to collect
+TOTAL_SAMPLES = 9000  # 180 seconds × 50 Hz (optimal for smooth PPG + accurate respiratory)
 
 # Data storage configuration
 DATA_STORAGE_DIR = Path("ppg_data")  # Directory to store collected data
@@ -171,6 +178,7 @@ def _on_ws_message(ws, message):
     # Binary data (chunks)
     if isinstance(message, (bytes, bytearray)):
         data = message
+        logger.info(f"[DEBUG] Received BINARY message, length: {len(data)} bytes")
         try:
             if len(data) < 4:
                 logger.error("Received binary message too short")
@@ -179,6 +187,8 @@ def _on_ws_message(ws, message):
             chunk_num = struct.unpack('<H', data[0:2])[0]
             total_chunks = data[2]
             sample_count = data[3]
+            
+            logger.info(f"[DEBUG] Chunk header: num={chunk_num}, total={total_chunks}, samples={sample_count}")
 
             samples = []
             for i in range(sample_count):
@@ -195,15 +205,22 @@ def _on_ws_message(ws, message):
 
             global save_triggered
 
-            # If collection complete, schedule processing
+            # If collection complete, schedule processing and stop device streaming
             if total_received >= TOTAL_SAMPLES and not save_triggered:
                 save_triggered = True  # ✅ Prevent re-triggering
                 collection_metadata["end_time"] = datetime.now()
-                
+
+                # Proactively send STOP/CANCEL to ESP32 to halt further streaming
+                try:
+                    ws.send("C")
+                    logger.info("Sent STOP command to ESP32 (TOTAL_SAMPLES reached)")
+                except Exception as e:
+                    logger.warning(f"Failed to send STOP to ESP32: {e}")
+
                 logger.info("Buffer reached TOTAL_SAMPLES, scheduling save and processing")
                 if main_event_loop:
                     asyncio.run_coroutine_threadsafe(
-                        save_and_process_data(), 
+                        save_and_process_data(),
                         main_event_loop
                     )
 
@@ -308,6 +325,11 @@ async def start_collection():
             collection_metadata["start_time"] = datetime.now()
             collection_metadata["end_time"] = None
             collection_metadata["last_saved_file"] = None
+            # Reset flags and set defaults; will be corrected after capture
+            global save_triggered
+            save_triggered = False
+            collection_metadata["sample_rate"] = 100
+            collection_metadata["duration_seconds"] = 60
 
         if connected_ws_app:
             try:
@@ -462,136 +484,125 @@ async def save_ppg_data(ppg_signal: np.ndarray) -> dict:
 
 async def save_and_process_data():
     """
-    Complete workflow with UI update:
+    Streamlined workflow:
     1. Convert & unscale
-    2. SAVE data to disk
-    3. Send to preprocessing service
-    4. Get result from preprocessing
-    5. Send result to UI service ← NEW STEP
+    2. SAVE data to disk (if ENABLE_CSV_SAVE=True)
+    3. Send to preprocessing /preprocess_combined
+    4. Preprocessing handles model inference, respiratory analysis, and UI update
     """
     global ppg_buffer, collection_status
 
     try:
         logger.info(f"Starting save and process workflow for {len(ppg_buffer)} samples...")
         
-        # Step 1: Convert to numpy array
-        ppg_signal = np.array(ppg_buffer, dtype=np.float64)
-        logger.info(f"Converted to numpy array: {ppg_signal.shape}")
+        # Step 1: Convert to numpy array and hard-cap to TOTAL_SAMPLES
+        with state_lock:
+            buf_copy = list(ppg_buffer)
+        if len(buf_copy) >= TOTAL_SAMPLES:
+            buf_copy = buf_copy[:TOTAL_SAMPLES]
+        ppg_signal = np.array(buf_copy, dtype=np.float64)
+        logger.info(f"Converted to numpy array (capped): {ppg_signal.shape}")
         
         # Step 2: Unscale data (ESP32 divided by 4)
         ppg_signal = ppg_signal * 4
         logger.info(f"Unscaled data: mean={ppg_signal.mean():.2f}, std={ppg_signal.std():.2f}")
         
-        # Step 3: SAVE DATA TO DISK
-        logger.info("=" * 60)
-        logger.info("SAVING PPG DATA TO DISK")
-        logger.info("=" * 60)
-        
-        save_result = await save_ppg_data(ppg_signal)
-        
+        # Compute effective duration and sampling rate from start/end times
+        start_time = collection_metadata.get("start_time")
+        end_time = collection_metadata.get("end_time")
+        duration_seconds = None
+        if start_time and end_time:
+            try:
+                duration_seconds = max((end_time - start_time).total_seconds(), 0.0)
+            except Exception:
+                duration_seconds = None
+        if not duration_seconds or duration_seconds <= 0:
+            # Fallback: assume near 100 Hz
+            duration_seconds = float(len(ppg_signal)) / 100.0 if len(ppg_signal) > 0 else 0.0
+        effective_fs = float(len(ppg_signal)) / duration_seconds if duration_seconds > 0 else 100.0
+
+        logger.info(
+            f"[Timing] start={start_time}, end={end_time}, duration={duration_seconds:.3f}s, fs_eff={effective_fs:.2f} Hz"
+        )
+
+        # Update metadata for saving and downstream services
+        collection_metadata["duration_seconds"] = float(duration_seconds)
+        collection_metadata["sample_rate"] = float(effective_fs)
+
         csv_file_path = None
         
-        if save_result["success"]:
-            logger.info(f"✓ Data saved successfully!")
-            # Get CSV file path
-            csv_file_path = save_result['files'].get('csv')
-            logger.info(f"✓ CSV saved at: {csv_file_path}")
-            for format_name, file_path in save_result['files'].items():
-                logger.info(f"  - {format_name.upper()}: {file_path}")
+        # Step 3: OPTIONALLY SAVE DATA TO DISK (archival)
+        if ENABLE_CSV_SAVE:
+            logger.info("=" * 60)
+            logger.info("SAVING PPG DATA TO DISK")
+            logger.info("=" * 60)
+            
+            save_result = await save_ppg_data(ppg_signal)
+            
+            if save_result["success"]:
+                logger.info(f"✓ Data saved successfully!")
+                csv_file_path = save_result['files'].get('csv')
+                logger.info(f"✓ CSV saved at: {csv_file_path}")
+                for format_name, file_path in save_result['files'].items():
+                    logger.info(f"  - {format_name.upper()}: {file_path}")
+            else:
+                logger.error(f"✗ Failed to save data: {save_result.get('error')}")
+            
+            logger.info("=" * 60)
         else:
-            logger.error(f"✗ Failed to save data: {save_result.get('error')}")
+            logger.info("CSV saving disabled (ENABLE_CSV_SAVE=False)")
         
-        logger.info("=" * 60)
+    # Step 4: Send to preprocessing /preprocess_combined (pass effective sampling_rate)
+        logger.info("Sending data to preprocessing service /preprocess_combined...")
+        logger.info("Preprocessing will run glucose+respiratory in parallel and notify UI")
         
-        # Step 4: Send to preprocessing service (with retries)
-        logger.info("Sending data to preprocessing service...")
-
-        preprocessing_result = None
-        async with httpx.AsyncClient(timeout=60.0) as client:
-                try:
-                    preprocessing_response = await post_with_retry(
-                        client,
-                        f"{PREPROCESSING_SERVICE_URL}/preprocess",
-                        json={"signal": ppg_signal.tolist()},
-                        retries=3,
-                        backoff=1.0,
-                    )
-                except Exception as e:
-                    logger.error(f"Preprocessing request failed after retries: {e}")
-                    preprocessing_response = None
-
-                if preprocessing_response is not None and preprocessing_response.status_code == 200:
+        async with httpx.AsyncClient(timeout=90.0) as client:
+            try:
+                preprocessing_response = await post_with_retry(
+                    client,
+                    f"{PREPROCESSING_SERVICE_URL}/preprocess_combined",
+                    json={
+                        "signal": ppg_signal.tolist(),
+                        "sampling_rate": int(round(effective_fs)),
+                        "csv_file": csv_file_path
+                    },
+                    retries=3,
+                    backoff=1.0,
+                )
+                
+                if preprocessing_response.status_code == 200:
                     result = preprocessing_response.json()
-                    logger.info(f"✓ Preprocessing complete: {result.get('num_segments')} segments")
-                    preprocessing_result = result
+                    logger.info(f"✓ Combined preprocessing complete!")
+                    logger.info(f"  - Glucose: {result.get('glucose')} mg/dL")
+                    logger.info(f"  - Segments: {result.get('num_segments')}")
+                    logger.info(f"  - Respiratory Rate: {result.get('resp_rate_bpm')} bpm")
+                    logger.info(f"  - UI notified by preprocessing service")
+                    
+                    with state_lock:
+                        collection_status = "COMPLETE"
+                    
+                    return {
+                        "success": True,
+                        "preprocessing_result": result,
+                        "csv_file": csv_file_path
+                    }
                 else:
-                    if preprocessing_response is None:
-                        logger.error("Preprocessing service unreachable or failed after retries")
-                    else:
-                        logger.error(f"Preprocessing returned status {preprocessing_response.status_code}: {preprocessing_response.text}")
-
-                # Prepare UI payload; do not use fallback glucose to avoid overwriting model's value
-                num_segments = preprocessing_result.get('num_segments', 0) if preprocessing_result else 0
-                quality_score = preprocessing_result.get('quality_score', 0.0) if preprocessing_result else 0.0
-                glucose_prediction = None  # No fallback; will be updated by model service
-
-                logger.info("=" * 60)
-                logger.info("SENDING RESULTS TO UI SERVICE (best-effort)")
-                logger.info("=" * 60)
-
-                ui_payload = {
-                    "glucose": glucose_prediction,
-                    "num_segments": num_segments,
-                    "quality_score": quality_score,
-                    "device": "ESP32-PPG-Glucose",
-                    "csv_file": csv_file_path,
-                    "preprocessing_ok": bool(preprocessing_result)
-                }
-
-                try:
-                    # Use the same client and retry helper for UI notifications
-                    try:
-                        ui_response = await post_with_retry(
-                            client,
-                            f"{UI_SERVICE_URL}/update_result",
-                            json=ui_payload,
-                            retries=2,
-                            backoff=0.5,
-                        )
-                    except Exception as uie:
-                        logger.error(f"Failed to notify UI after retries: {uie}")
-                        ui_response = None
-
-                    if ui_response is not None and ui_response.status_code == 200:
-                        logger.info("✓ Results sent to UI service successfully")
-                        if glucose_prediction is not None:
-                            logger.info(f"  - Glucose: {float(glucose_prediction):.1f} mg/dL")
-                        else:
-                            logger.info("  - Glucose: None (waiting for model)")
-                        logger.info(f"  - Segments: {num_segments}")
-                        logger.info(f"  - Quality: {quality_score:.2%}")
-                        logger.info(f"  - CSV File: {csv_file_path}")
-                    else:
-                        logger.warning("UI service update did not succeed or returned non-200 status")
-
-                except Exception as ui_error:
-                    logger.exception(f"Unexpected error sending to UI service: {ui_error}")
-
+                    logger.error(f"Preprocessing returned status {preprocessing_response.status_code}: {preprocessing_response.text}")
+                    with state_lock:
+                        collection_status = "COMPLETE_WITH_WARNINGS"
+                    return {"success": False, "error": f"Status {preprocessing_response.status_code}"}
+                    
+            except Exception as e:
+                logger.error(f"Preprocessing request failed after retries: {e}")
                 with state_lock:
-                    collection_status = "COMPLETE" if preprocessing_result else "COMPLETE_WITH_WARNINGS"
-
-                return {
-                    "preprocessing": preprocessing_result,
-                    "saved_data": save_result,
-                    "csv_file": csv_file_path,
-                    "glucose": glucose_prediction
-                }
+                    collection_status = "ERROR"
+                return {"success": False, "error": str(e)}
 
     except Exception as e:
         logger.exception(f"Error in save_and_process_data: {e}")
         with state_lock:
             collection_status = "ERROR"
-        return None
+        return {"success": False, "error": str(e)}
 
 
 @app.post("/stop")
@@ -634,61 +645,56 @@ async def disconnect_device():
 
 
 # ============================================================================
-# NEW ENDPOINT: List Saved Data Files
+# DOWNLOAD ENDPOINTS (conditionally registered based on ENABLE_DOWNLOAD_ENDPOINTS)
 # ============================================================================
 
-@app.get("/saved_data")
-async def list_saved_data():
-    """
-    List all saved PPG data files
-    """
-    try:
-        files = {
-            "npy": sorted(DATA_STORAGE_DIR.glob("*.npy")),
-            "csv": sorted(DATA_STORAGE_DIR.glob("*.csv")),
-            "json": sorted(DATA_STORAGE_DIR.glob("*.json")),
-            "summary": sorted(DATA_STORAGE_DIR.glob("*_summary.txt"))
-        }
+if ENABLE_DOWNLOAD_ENDPOINTS:
+    @app.get("/saved_data")
+    async def list_saved_data():
+        """
+        List all saved PPG data files
+        """
+        try:
+            files = {
+                "npy": sorted(DATA_STORAGE_DIR.glob("*.npy")),
+                "csv": sorted(DATA_STORAGE_DIR.glob("*.csv")),
+                "json": sorted(DATA_STORAGE_DIR.glob("*.json")),
+                "summary": sorted(DATA_STORAGE_DIR.glob("*_summary.txt"))
+            }
+            
+            file_list = {}
+            for format_name, paths in files.items():
+                file_list[format_name] = [str(p) for p in paths]
+            
+            return {
+                "storage_directory": str(DATA_STORAGE_DIR),
+                "total_files": sum(len(v) for v in file_list.values()),
+                "files_by_format": file_list
+            }
+        except Exception as e:
+            logger.exception(f"Error listing saved data: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @app.get("/download/{filename}")
+    async def download_file(filename: str):
+        """
+        Download a specific saved data file
+        """
+        file_path = DATA_STORAGE_DIR / filename
         
-        file_list = {}
-        for format_name, paths in files.items():
-            file_list[format_name] = [str(p) for p in paths]
+        if not file_path.exists():
+            raise HTTPException(status_code=404, detail="File not found")
         
-        return {
-            "storage_directory": str(DATA_STORAGE_DIR),
-            "total_files": sum(len(v) for v in file_list.values()),
-            "files_by_format": file_list
-        }
-    except Exception as e:
-        logger.exception(f"Error listing saved data: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-
-# ============================================================================
-# NEW ENDPOINT: Download Specific File
-# ============================================================================
-
-
-
-@app.get("/download/{filename}")
-async def download_file(filename: str):
-    """
-    Download a specific saved data file
-    """
-    file_path = DATA_STORAGE_DIR / filename
-    
-    if not file_path.exists():
-        raise HTTPException(status_code=404, detail="File not found")
-    
-    if not file_path.is_file():
-        raise HTTPException(status_code=400, detail="Not a file")
-    
-    return FileResponse(
-        path=file_path,
-        filename=filename,
-        media_type='application/octet-stream'
-    )
+        if not file_path.is_file():
+            raise HTTPException(status_code=400, detail="Not a file")
+        
+        return FileResponse(
+            path=file_path,
+            filename=filename,
+            media_type='application/octet-stream'
+        )
+else:
+    logger.info("Download endpoints disabled (ENABLE_DOWNLOAD_ENDPOINTS=False)")
 
 
 if __name__ == "__main__":
