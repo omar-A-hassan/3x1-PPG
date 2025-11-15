@@ -13,10 +13,10 @@ from typing import Optional, List
 from datetime import datetime
 import asyncio
 from threading import Lock
+from functools import wraps
 import numpy as np
 import pandas as pd
 from pathlib import Path
-import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
 from scipy.signal import welch, spectrogram
 
@@ -72,52 +72,78 @@ class ResultState:
         self.history = []
         self.latest_csv_file = None  # NEW: Track latest data file
 
-    def update(self, glucose: Optional[float], num_segments: int, quality_score: float, 
-               device: str, csv_file: Optional[str] = None,
-               resp_rate_bpm: Optional[float] = None,
-               resp_freq_hz: Optional[float] = None,
-               esqi: Optional[float] = None,
-               entropy: Optional[float] = None,
-               peaks_count: Optional[int] = None,
-               method_used: Optional[str] = None,
-               raw_signal: Optional[List[float]] = None,
-               timestamps_ms: Optional[List[float]] = None,
-               freqs: Optional[List[float]] = None,
-               psd: Optional[List[float]] = None):
+    def update(
+        self,
+        *,  # enforce keyword-only to prevent mistakes
+        glucose: Optional[float] = None,
+        num_segments: int = 0,
+        quality_score: float = 0.0,
+        device: str = "Unknown",
+        csv_file: Optional[str] = None,
+        resp_rate_bpm: Optional[float] = None,
+        resp_freq_hz: Optional[float] = None,
+        esqi: Optional[float] = None,
+        entropy: Optional[float] = None,
+        peaks_count: Optional[int] = None,
+        method_used: Optional[str] = None,
+        raw_signal: Optional[List[float]] = None,
+        timestamps_ms: Optional[List[float]] = None,
+        freqs: Optional[List[float]] = None,
+        psd: Optional[List[float]] = None,
+    ) -> None:
+        """Update result state with flexible keyword args.
+
+        Preserves previous values when new ones are not provided (None).
+        Appends to history (max 50 entries).
+        """
         with self.lock:
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            # Preserve previous glucose value if not provided (avoid overwriting model result)
             prev = self.latest_result or {}
-            glucose_val = glucose if glucose is not None else prev.get("glucose")
+
+            # Helper to keep previous value if new is None
+            def keep(prev_key: str, new_val):
+                return new_val if new_val is not None else prev.get(prev_key)
+
             result = {
                 "timestamp": timestamp,
-                "glucose": glucose_val,
-                "num_segments": num_segments,
-                "quality_score": quality_score,
-                "device": device,
-                "csv_file": csv_file,
-                "resp_rate_bpm": resp_rate_bpm,
-                "resp_freq_hz": resp_freq_hz,
-                "esqi": esqi,
-                "entropy": entropy,
-                "peaks_count": peaks_count,
-                "method_used": method_used,
-                "raw_signal": raw_signal,
-                "timestamps_ms": timestamps_ms,
-                "freqs": freqs,
-                "psd": psd,
+                "glucose": keep("glucose", glucose),
+                "num_segments": keep("num_segments", num_segments),
+                "quality_score": keep("quality_score", quality_score),
+                "device": keep("device", device),
+                "csv_file": keep("csv_file", csv_file),
+                # Respiratory
+                "resp_rate_bpm": keep("resp_rate_bpm", resp_rate_bpm),
+                "resp_freq_hz": keep("resp_freq_hz", resp_freq_hz),
+                "esqi": keep("esqi", esqi),
+                "entropy": keep("entropy", entropy),
+                "peaks_count": keep("peaks_count", peaks_count),
+                "method_used": keep("method_used", method_used),
+                # Data for plotting
+                "raw_signal": keep("raw_signal", raw_signal),
+                "timestamps_ms": keep("timestamps_ms", timestamps_ms),
+                "freqs": keep("freqs", freqs),
+                "psd": keep("psd", psd),
             }
+
             self.latest_result = result
-            self.latest_csv_file = csv_file  # NEW
+            self.latest_csv_file = result.get("csv_file")
+
             self.history.append(result)
             if len(self.history) > 50:
                 self.history = self.history[-50:]
-            if glucose_val is not None:
-                logger.info(f"Updated result: {float(glucose_val):.1f} mg/dL, CSV: {csv_file}")
-            else:
-                logger.info(f"Updated result: glucose=None, CSV: {csv_file}")
-            if resp_rate_bpm is not None:
-                logger.info(f"Respiratory rate: {resp_rate_bpm:.1f} bpm, ESQI: {esqi}")
+
+            # Logging summaries
+            if result.get("glucose") is not None:
+                try:
+                    logger.info(
+                        f"Updated: {float(result['glucose']):.1f} mg/dL, CSV: {self.latest_csv_file}"
+                    )
+                except Exception:
+                    logger.info("Updated: glucose value present (formatting failed)")
+            if result.get("resp_rate_bpm") is not None:
+                logger.info(
+                    f"Respiratory: {result['resp_rate_bpm']:.1f} bpm, ESQI: {result.get('esqi')}"
+                )
             logger.debug("ResultState.update finished")
 
     def get_latest(self):
@@ -144,21 +170,21 @@ async def update_result(request: UpdateResultRequest):
     """
     try:
         result_state.update(
-            request.glucose,
-            request.num_segments,
-            request.quality_score,
-            request.device,
-            request.csv_file,
-            request.resp_rate_bpm,
-            request.resp_freq_hz,
-            request.esqi,
-            request.entropy,
-            request.peaks_count,
-            request.method_used,
-            request.raw_signal,
-            request.timestamps_ms,
-            request.freqs,
-            request.psd,
+            glucose=request.glucose,
+            num_segments=request.num_segments,
+            quality_score=request.quality_score,
+            device=request.device,
+            csv_file=request.csv_file,
+            resp_rate_bpm=request.resp_rate_bpm,
+            resp_freq_hz=request.resp_freq_hz,
+            esqi=request.esqi,
+            entropy=request.entropy,
+            peaks_count=request.peaks_count,
+            method_used=request.method_used,
+            raw_signal=request.raw_signal,
+            timestamps_ms=request.timestamps_ms,
+            freqs=request.freqs,
+            psd=request.psd,
         )
         # Best-effort: if a CSV path was provided but the UI can't access it locally,
         # attempt to download it from the receiver service using the filename.
@@ -205,6 +231,40 @@ async def health():
 
 
 # ============================================================================
+# PLOTTING UTILITIES
+# ============================================================================
+
+def safe_plot(fallback_message: str = "Plot generation failed"):
+    """Decorator to handle plot errors gracefully with full traceback logging.
+    
+    Args:
+        fallback_message: Message to display in placeholder figure if plot fails
+        
+    Returns:
+        Decorator function that wraps plotting functions with error handling
+        
+    Example:
+        @safe_plot("Failed to create overview plot")
+        def create_overview_plot(timestamps, ir_values):
+            # ... plot code ...
+            return fig
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                logger.error(
+                    f"{func.__name__} failed: {e}",
+                    exc_info=True  # ✅ Logs full stack trace for debugging
+                )
+                return create_placeholder_figure(fallback_message)
+        return wrapper
+    return decorator
+
+
+# ============================================================================
 # PLOTTING FUNCTIONS (from your data_plot.py)
 # ============================================================================
 
@@ -240,7 +300,7 @@ def create_placeholder_figure(message: str, figsize=(10, 3)):
         # As a last resort, return an empty figure object
         return Figure(figsize=figsize)
 
-
+@safe_plot("Failed to generate segment plots")
 def create_segment_plots(timestamps, ir_values, segment_length=10.0):
     """
     Create time-domain segment plots
@@ -287,117 +347,107 @@ def create_segment_plots(timestamps, ir_values, segment_length=10.0):
     return figures
 
 
+@safe_plot("Failed to generate spectrum plot")
 def create_spectrum_plot(ir_values, fs=100):
     """Create Welch power spectrum plot"""
-    try:
-        f, Pxx = welch(ir_values, fs=fs, nperseg=min(2048, len(ir_values)))
-        
-        fig = Figure(figsize=(10, 5))
-        ax = fig.add_subplot(111)
-        
-        ax.semilogy(f, Pxx, linewidth=2)
-        ax.set_xlabel('Frequency [Hz]', fontsize=11)
-        ax.set_ylabel('Power Spectral Density', fontsize=11)
-        ax.set_title('Welch Power Spectrum of IR Signal', fontsize=12, fontweight='bold')
-        ax.grid(True, alpha=0.3)
-        
-        # Highlight physiological frequency range (0.5-3 Hz for heart rate)
-        ax.axvspan(0.5, 3.0, alpha=0.2, color='green', label='Heart Rate Range')
-        ax.legend()
-        
-        return fig
-    except Exception as e:
-        logger.error(f"Failed to create spectrum plot: {e}")
-        return create_placeholder_figure("Failed to generate spectrum plot")
+    f, Pxx = welch(ir_values, fs=fs, nperseg=min(2048, len(ir_values)))
+    
+    fig = Figure(figsize=(10, 5))
+    ax = fig.add_subplot(111)
+    
+    ax.semilogy(f, Pxx, linewidth=2)
+    ax.set_xlabel('Frequency [Hz]', fontsize=11)
+    ax.set_ylabel('Power Spectral Density', fontsize=11)
+    ax.set_title('Welch Power Spectrum of IR Signal', fontsize=12, fontweight='bold')
+    ax.grid(True, alpha=0.3)
+    
+    # Highlight physiological frequency range (0.5-3 Hz for heart rate)
+    ax.axvspan(0.5, 3.0, alpha=0.2, color='green', label='Heart Rate Range')
+    ax.legend()
+    
+    return fig
 
 
+@safe_plot("Failed to generate spectrogram")
 def create_spectrogram_plot(ir_values, fs=100):
     """Create spectrogram plot"""
-    try:
-        f, t, Sxx = spectrogram(ir_values, fs=fs, nperseg=256, noverlap=200)
-        
-        fig = Figure(figsize=(10, 5))
-        ax = fig.add_subplot(111)
-        
-        im = ax.pcolormesh(t, f, 10*np.log10(Sxx + 1e-10), shading='gouraud', cmap='viridis')
-        ax.set_ylabel('Frequency [Hz]', fontsize=11)
-        ax.set_xlabel('Time [seconds]', fontsize=11)
-        ax.set_title('Spectrogram of IR Signal', fontsize=12, fontweight='bold')
-        fig.colorbar(im, ax=ax, label='Power [dB]')
-        
-        return fig
-    except Exception as e:
-        logger.error(f"Failed to create spectrogram: {e}")
-        return create_placeholder_figure("Failed to generate spectrogram")
+    f, t, Sxx = spectrogram(ir_values, fs=fs, nperseg=256, noverlap=200)
+    
+    fig = Figure(figsize=(10, 5))
+    ax = fig.add_subplot(111)
+    
+    im = ax.pcolormesh(t, f, 10*np.log10(Sxx + 1e-10), shading='gouraud', cmap='viridis')
+    ax.set_ylabel('Frequency [Hz]', fontsize=11)
+    ax.set_xlabel('Time [seconds]', fontsize=11)
+    ax.set_title('Spectrogram of IR Signal', fontsize=12, fontweight='bold')
+    fig.colorbar(im, ax=ax, label='Power [dB]')
+    
+    return fig
 
 
+@safe_plot("Failed to generate respiratory PSD plot")
 def create_respiratory_psd_plot(freqs, psd, resp_freq_hz=None):
     """Create respiratory PSD plot with highlighted peak"""
-    try:
-        fig = Figure(figsize=(10, 5))
-        ax = fig.add_subplot(111)
-        
-        ax.plot(freqs, psd, linewidth=2, color='tab:blue')
-        ax.set_xlabel('Frequency [Hz]', fontsize=11)
-        ax.set_ylabel('Power Spectral Density', fontsize=11)
-        ax.set_title('Respiratory Component PSD (Welch Method)', fontsize=12, fontweight='bold')
-        ax.grid(True, alpha=0.3)
-        
-        # Highlight respiratory band (0.1-0.4 Hz)
-        ax.axvspan(0.1, 0.4, alpha=0.2, color='green', label='Respiratory Band')
-        
-        # Mark detected respiratory frequency
-        if resp_freq_hz is not None and len(freqs) > 0:
-            ax.axvline(x=resp_freq_hz, color='red', linestyle='--', linewidth=2, 
-                      label=f'Detected: {resp_freq_hz:.3f} Hz')
-        
-        ax.legend()
-        xlim_max = max(0.5, freqs[-1]) if len(freqs) > 0 else 0.5
-        ax.set_xlim(0, xlim_max)
-        
-        return fig
-    except Exception as e:
-        logger.error(f"Failed to create respiratory PSD plot: {e}")
-        return create_placeholder_figure("Failed to generate respiratory PSD plot")
+    fig = Figure(figsize=(10, 5))
+    ax = fig.add_subplot(111)
+    
+    ax.plot(freqs, psd, linewidth=2, color='tab:blue')
+    ax.set_xlabel('Frequency [Hz]', fontsize=11)
+    ax.set_ylabel('Power Spectral Density', fontsize=11)
+    ax.set_title('Respiratory Component PSD (Welch Method)', fontsize=12, fontweight='bold')
+    ax.grid(True, alpha=0.3)
+    
+    # Highlight respiratory band (0.1-0.4 Hz)
+    ax.axvspan(0.1, 0.4, alpha=0.2, color='green', label='Respiratory Band')
+    
+    # Mark detected respiratory frequency
+    if resp_freq_hz is not None and len(freqs) > 0:
+        ax.axvline(x=resp_freq_hz, color='red', linestyle='--', linewidth=2, 
+                  label=f'Detected: {resp_freq_hz:.3f} Hz')
+    
+    ax.legend()
+    # Limit x-axis to 0-2 Hz for respiratory analysis
+    ax.set_xlim(0, 2.0)
+    
+    return fig
 
 
+@safe_plot("Failed to generate overview plot")
 def create_overview_plot(timestamps, ir_values):
     """Create overview plot of entire signal"""
-    try:
-        fig = Figure(figsize=(12, 4))
-        ax = fig.add_subplot(111)
-        
-        ax.plot(timestamps, ir_values, linewidth=0.5, alpha=0.8, color='blue')
-        ax.set_xlabel('Time (seconds)', fontsize=11)
-        ax.set_ylabel('IR Value', fontsize=11)
-        
-        # Dynamic title based on actual duration
-        duration = timestamps[-1] - timestamps[0] if len(timestamps) > 0 else 0
-        ax.set_title(f'Complete PPG Signal ({duration:.0f} seconds)', fontsize=12, fontweight='bold')
-        ax.grid(True, alpha=0.3)
-        
-        # Add statistics box
-        stats_text = f"Samples: {len(ir_values)}\n"
-        stats_text += f"Mean: {ir_values.mean():.1f}\n"
-        stats_text += f"Std: {ir_values.std():.1f}\n"
-        stats_text += f"Range: [{ir_values.min():.0f}, {ir_values.max():.0f}]"
-        
-        ax.text(0.02, 0.98, stats_text, transform=ax.transAxes,
-               verticalalignment='top', fontsize=9,
-               bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.7))
-        
-        return fig
-    except Exception as e:
-        logger.error(f"Failed to create overview plot: {e}")
-        return create_placeholder_figure("Failed to generate overview plot")
+    fig = Figure(figsize=(12, 4))
+    ax = fig.add_subplot(111)
+    
+    ax.plot(timestamps, ir_values, linewidth=0.5, alpha=0.8, color='blue')
+    ax.set_xlabel('Time (seconds)', fontsize=11)
+    ax.set_ylabel('IR Value', fontsize=11)
+    
+    # Dynamic title based on actual duration
+    duration = timestamps[-1] - timestamps[0] if len(timestamps) > 0 else 0
+    ax.set_title(f'Complete PPG Signal ({duration:.0f} seconds)', fontsize=12, fontweight='bold')
+    ax.grid(True, alpha=0.3)
+    
+    # Add statistics box
+    stats_text = f"Samples: {len(ir_values)}\n"
+    stats_text += f"Mean: {ir_values.mean():.1f}\n"
+    stats_text += f"Std: {ir_values.std():.1f}\n"
+    stats_text += f"Range: [{ir_values.min():.0f}, {ir_values.max():.0f}]"
+    
+    ax.text(0.02, 0.98, stats_text, transform=ax.transAxes,
+           verticalalignment='top', fontsize=9,
+           bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.7))
+    
+    return fig
 
 
 async def compute_respiratory_rate(csv_path: Path):
     """Call preprocessing service to estimate respiratory rate from PPG data"""
     try:
-        # Load IR values from CSV
-        df = pd.read_csv(csv_path)
-        ir_values = df['IR_Value'].tolist()
+        # Load IR values from CSV using helper
+        _, ir_values = load_ppg_from_csv(csv_path)
+        if ir_values is None:
+            logger.error(f"Failed to load CSV data from {csv_path}")
+            return None
         
         logger.info(f"Requesting respiratory analysis for {len(ir_values)} samples")
         
@@ -426,17 +476,6 @@ async def compute_respiratory_rate(csv_path: Path):
 
 def create_gradio_interface():
     
-    async def send_command(endpoint: str):
-        """Send POST to /collect or /stop"""
-        try:
-            async with httpx.AsyncClient(timeout=20.0) as client:
-                resp = await client.post(f"{RECEIVER_SERVICE_URL}/{endpoint}")
-                if resp.status_code == 200:
-                    return f"✅ {endpoint.capitalize()} command sent successfully."
-                else:
-                    return f"⚠️ Failed: {resp.text}"
-        except Exception as e:
-            return f"❌ Error: {e}"
 
     def send_command_sync(endpoint: str):
         """Synchronous helper for Gradio button callbacks to avoid asyncio.run nested loops.
@@ -538,63 +577,62 @@ def create_gradio_interface():
             )
         return "\n".join(lines)
 
+    @safe_plot("Failed to generate history plot")
     def _get_history_plot():
         """Plot glucose history"""
-        try:
-            history = result_state.get_history()
-            if len(history) < 2:
-                return create_placeholder_figure("Not enough history to plot")
-            
-            # Filter out None glucose values
-            valid_history = [(i, r['glucose']) for i, r in enumerate(history) if r.get('glucose') is not None]
-            
-            if len(valid_history) < 2:
-                return create_placeholder_figure("Not enough valid glucose readings to plot")
-            
-            indices, glucose_values = zip(*valid_history)
-            
-            fig = Figure(figsize=(10, 5))
-            ax = fig.add_subplot(111)
-            
-            ax.plot(indices, glucose_values, 'bo-', 
-                   linewidth=2, markersize=8)
-            ax.axhline(y=70, color='r', linestyle='--', label='Low threshold')
-            ax.axhline(y=140, color='g', linestyle='--', label='Normal threshold')
-            ax.axhline(y=200, color='orange', linestyle='--', label='High threshold')
-            
-            ax.set_xlabel('Measurement', fontsize=11)
-            ax.set_ylabel('Glucose (mg/dL)', fontsize=11)
-            ax.set_title('Glucose Level History', fontsize=12, fontweight='bold')
-            ax.grid(True, alpha=0.3)
-            ax.legend()
-            
-            return fig
-        except Exception as e:
-            logger.error(f"Failed to plot history: {e}")
-            return create_placeholder_figure("Failed to generate history plot")
+        history = result_state.get_history()
+        if len(history) < 2:
+            return create_placeholder_figure("Not enough history to plot")
+        
+        # Filter out None glucose values
+        valid_history = [(i, r['glucose']) for i, r in enumerate(history) if r.get('glucose') is not None]
+        
+        if len(valid_history) < 2:
+            return create_placeholder_figure("Not enough valid glucose readings to plot")
+        
+        indices, glucose_values = zip(*valid_history)
+        
+        fig = Figure(figsize=(10, 5))
+        ax = fig.add_subplot(111)
+        
+        ax.plot(indices, glucose_values, 'bo-', 
+               linewidth=2, markersize=8)
+        ax.axhline(y=70, color='r', linestyle='--', label='Low threshold')
+        ax.axhline(y=140, color='g', linestyle='--', label='Normal threshold')
+        ax.axhline(y=200, color='orange', linestyle='--', label='High threshold')
+        
+        ax.set_xlabel('Measurement', fontsize=11)
+        ax.set_ylabel('Glucose (mg/dL)', fontsize=11)
+        ax.set_title('Glucose Level History', fontsize=12, fontweight='bold')
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        
+        return fig
 
-    def generate_signal_plots():
+    def get_signal_data():
+        """Get signal data from in-memory result or CSV fallback.
+
+        Returns: (timestamps[np.ndarray], ir_values[np.ndarray], data_source[str])
+                 or (None, None, None) if unavailable
+        """
         result = result_state.get_latest()
-        
-        # Try to use in-memory data first
-        timestamps = None
-        ir_values = None
-        data_source = None
-        
         if result and result.get("raw_signal") is not None and result.get("timestamps_ms") is not None:
-            # Use in-memory data
-            ir_values = np.array(result["raw_signal"])
-            timestamps = np.array(result["timestamps_ms"]) / 1000.0  # Convert ms to seconds
-            data_source = "in-memory"
+            ir_values = np.array(result["raw_signal"], dtype=float)
+            timestamps = np.array(result["timestamps_ms"], dtype=float) / 1000.0
             logger.info("Using in-memory raw signal for plotting")
-        elif ENABLE_CSV_FALLBACK:
-            # Fallback to CSV file
+            return timestamps, ir_values, "in-memory"
+        if ENABLE_CSV_FALLBACK:
             csv_file = result_state.get_latest_csv()
             if csv_file and Path(csv_file).exists():
-                timestamps, ir_values = load_ppg_from_csv(Path(csv_file))
-                if timestamps is not None:
-                    data_source = f"CSV ({Path(csv_file).name})"
+                t, y = load_ppg_from_csv(Path(csv_file))
+                if t is not None and y is not None:
                     logger.info(f"Using CSV fallback for plotting: {csv_file}")
+                    return np.asarray(t), np.asarray(y), f"CSV ({Path(csv_file).name})"
+        logger.warning("No signal data available for plotting")
+        return None, None, None
+
+    def generate_signal_plots():
+        timestamps, ir_values, data_source = get_signal_data()
         
         # If no data available, return placeholders
         if timestamps is None or ir_values is None:
@@ -622,57 +660,101 @@ def create_gradio_interface():
         # **Unpack segments list into individual outputs**
         return (overview, *segments, spectrum, spectrogram, status_msg)
 
-    def compute_respiratory_sync():
-        """Synchronous wrapper to compute respiratory rate and update result state"""
+    def handle_respiratory_analysis(recompute: bool):
+        """
+        Unified respiratory analysis handler.
+
+        - When recompute=False: display from in-memory data (fast refresh)
+        - When recompute=True: recompute from latest CSV via preprocessing service
+
+        Returns: (status_markdown: str, psd_plot: Figure)
+        """
+        if not recompute:
+            # Fast path: show in-memory PSD if available
+            result = result_state.get_latest()
+            if not result:
+                return ("⚠️ No results available", create_placeholder_figure("No data available"))
+
+            freqs = result.get("freqs")
+            psd = result.get("psd")
+            resp_freq_hz = result.get("resp_freq_hz")
+
+            if freqs is not None and psd is not None:
+                freqs_arr = np.array(freqs)
+                psd_arr = np.array(psd)
+                psd_plot = create_respiratory_psd_plot(freqs_arr, psd_arr, resp_freq_hz)
+
+                resp_rate_bpm = result.get("resp_rate_bpm")
+                esqi = result.get("esqi")
+                entropy = result.get("entropy")
+                peaks_count = result.get("peaks_count")
+                method_used = result.get("method_used")
+
+                if resp_rate_bpm is not None:
+                    status = f"""
+✅ **Respiratory Metrics (from latest result)**
+
+**Rate:** {resp_rate_bpm:.1f} breaths/min  
+**Frequency:** {resp_freq_hz:.3f} Hz  
+**ESQI:** {esqi:.3f}  
+**Entropy:** {entropy:.3f}  
+**Peaks:** {peaks_count}  
+**Method:** {method_used}
+"""
+                else:
+                    status = "ℹ️ Respiratory data available (PSD plot shown)"
+
+                return (status, psd_plot)
+
+            return ("⚠️ No respiratory analysis data available", create_placeholder_figure("No PSD data"))
+
+        # Recompute path: call preprocessing service using latest CSV
         csv_file = result_state.get_latest_csv()
         if not csv_file or not Path(csv_file).exists():
             return ("⚠️ No data file available", create_placeholder_figure("No data available"))
-        
-        # Run async function in new event loop
+
         try:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
             resp_data = loop.run_until_complete(compute_respiratory_rate(Path(csv_file)))
             loop.close()
         except Exception as e:
-            logger.error(f"Error in respiratory computation: {e}")
+            logger.error(f"Error in respiratory computation: {e}", exc_info=True)
             return (f"❌ Error: {e}", create_placeholder_figure("Computation failed"))
-        
+
         if resp_data is None or not resp_data.get("success"):
             error_msg = resp_data.get("error", "Unknown error") if resp_data else "Request failed"
             return (f"⚠️ Analysis failed: {error_msg}", create_placeholder_figure("Analysis failed"))
-        
-        # Update result state with respiratory metrics
-        result = result_state.get_latest()
-        if result:
-            result_state.update(
-                glucose=result.get("glucose"),
-                num_segments=result.get("num_segments", 0),
-                quality_score=result.get("quality_score", 0.0),
-                device=result.get("device", "Unknown"),
-                csv_file=csv_file,
-                resp_rate_bpm=resp_data.get("resp_rate_bpm"),
-                resp_freq_hz=resp_data.get("resp_freq_hz"),
-                esqi=resp_data.get("esqi"),
-                entropy=resp_data.get("entropy"),
-                peaks_count=resp_data.get("peaks_count"),
-                method_used=resp_data.get("method_used"),
-                raw_signal=result.get("raw_signal"),
-                timestamps_ms=result.get("timestamps_ms"),
-                freqs=resp_data.get("freqs"),
-                psd=resp_data.get("psd"),
-            )
-        
-        # Create PSD plot
+
+        # Update result state with respiratory metrics (preserve other fields)
+        result = result_state.get_latest() or {}
+        result_state.update(
+            glucose=result.get("glucose"),
+            num_segments=result.get("num_segments", 0),
+            quality_score=result.get("quality_score", 0.0),
+            device=result.get("device", "Unknown"),
+            csv_file=csv_file,
+            resp_rate_bpm=resp_data.get("resp_rate_bpm"),
+            resp_freq_hz=resp_data.get("resp_freq_hz"),
+            esqi=resp_data.get("esqi"),
+            entropy=resp_data.get("entropy"),
+            peaks_count=resp_data.get("peaks_count"),
+            method_used=resp_data.get("method_used"),
+            raw_signal=result.get("raw_signal"),
+            timestamps_ms=result.get("timestamps_ms"),
+            freqs=resp_data.get("freqs"),
+            psd=resp_data.get("psd"),
+        )
+
+        # Build plot from recomputed PSD
         freqs = resp_data.get("freqs", [])
         psd = resp_data.get("psd", [])
         resp_freq_hz = resp_data.get("resp_freq_hz")
-        
-        if freqs and psd:
-            psd_plot = create_respiratory_psd_plot(freqs, psd, resp_freq_hz)
-        else:
-            psd_plot = create_placeholder_figure("No PSD data available")
-        
+        psd_plot = (
+            create_respiratory_psd_plot(freqs, psd, resp_freq_hz)
+            if freqs and psd else create_placeholder_figure("No PSD data available")
+        )
+
         status = f"""
 ✅ **Respiratory Analysis Complete**
 
@@ -683,51 +765,8 @@ def create_gradio_interface():
 **Peaks:** {resp_data.get('peaks_count', 0)}  
 **Method:** {resp_data.get('method_used', 'N/A')}
 """
-        
+
         return (status, psd_plot)
-
-    def refresh_respiratory_display():
-        """Display respiratory PSD from in-memory data (if available)"""
-        result = result_state.get_latest()
-        
-        if not result:
-            return ("⚠️ No results available", create_placeholder_figure("No data available"))
-        
-        # Check if we have in-memory PSD data
-        freqs = result.get("freqs")
-        psd = result.get("psd")
-        resp_freq_hz = result.get("resp_freq_hz")
-        
-        if freqs is not None and psd is not None:
-            # Convert lists to numpy arrays for plotting
-            freqs_arr = np.array(freqs)
-            psd_arr = np.array(psd)
-            psd_plot = create_respiratory_psd_plot(freqs_arr, psd_arr, resp_freq_hz)
-            
-            # Build status message
-            resp_rate_bpm = result.get("resp_rate_bpm")
-            esqi = result.get("esqi")
-            entropy = result.get("entropy")
-            peaks_count = result.get("peaks_count")
-            method_used = result.get("method_used")
-            
-            if resp_rate_bpm is not None:
-                status = f"""
-✅ **Respiratory Metrics (from latest result)**
-
-**Rate:** {resp_rate_bpm:.1f} breaths/min  
-**Frequency:** {resp_freq_hz:.3f} Hz  
-**ESQI:** {esqi:.3f}  
-**Entropy:** {entropy:.3f}  
-**Peaks:** {peaks_count}  
-**Method:** {method_used}
-"""
-            else:
-                status = "ℹ️ Respiratory data available (PSD plot shown)"
-            
-            return (status, psd_plot)
-        else:
-            return ("⚠️ No respiratory analysis data available", create_placeholder_figure("No PSD data"))
 
     # ========================================================================
     # BUILD GRADIO INTERFACE
@@ -735,7 +774,7 @@ def create_gradio_interface():
     
     with gr.Blocks(title="PPG Glucose Monitor") as interface:
         gr.Markdown("# 🩸 PPG-Based Glucose Monitor")
-        gr.Markdown("Real-time glucose prediction from photoplethysmography signals")
+        gr.Markdown("")
         
         # ====================================================================
         # TAB 1: GLUCOSE MONITORING
@@ -853,27 +892,37 @@ def create_gradio_interface():
             gr.Markdown("Analyze inter-beat intervals using Welch's method to estimate respiratory rate")
             
             with gr.Row():
-                refresh_resp_btn = gr.Button("🔄 Refresh Display", variant="secondary", size="lg")
-                compute_resp_btn = gr.Button("🔬 Re-compute Respiratory", variant="primary", size="lg")
+                recompute_checkbox = gr.Checkbox(label="Recompute from CSV", value=False)
+                analyze_resp_btn = gr.Button("🔍 Analyze", variant="primary", size="lg")
             
-            resp_status = gr.Markdown("Click 'Refresh Display' to show latest results or 'Re-compute' to reanalyze from CSV")
+            resp_status = gr.Markdown("Click 'Analyze' to show respiratory metrics (optionally recompute from CSV)")
             
             gr.Markdown("---")
             gr.Markdown("### Respiratory PSD Analysis")
             
             respiratory_psd_plot = gr.Plot(label="Respiratory Power Spectral Density")
             
-            # Respiratory refresh binding (uses in-memory data)
-            refresh_resp_btn.click(
-                fn=refresh_respiratory_display,
+            # Unified respiratory analysis binding
+            analyze_resp_btn.click(
+                fn=handle_respiratory_analysis,
+                inputs=[recompute_checkbox],
                 outputs=[resp_status, respiratory_psd_plot]
             )
-            
-            # Respiratory re-computation binding (recomputes from CSV)
-            compute_resp_btn.click(
-                fn=compute_respiratory_sync,
-                outputs=[resp_status, respiratory_psd_plot]
-            )
+
+        # ====================================================================
+        # TAB 3: Blood Pressure Analysis
+        # ====================================================================
+
+        with gr.Tab("💢 Blood Pressure Monitor"):
+            gr.Markdown("## This feature is under development")
+            gr.Markdown("")
+
+            with gr.Row():
+                compute_bp_btn = gr.Button("🔎 Compute Blood Pressure", variant="primary", scale=1)
+
+            gr.Markdown("###")
+            gr.Markdown("---")
+                
 
     return interface
 

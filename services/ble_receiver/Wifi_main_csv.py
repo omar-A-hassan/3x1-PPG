@@ -36,7 +36,7 @@ ENABLE_DOWNLOAD_ENDPOINTS = False  # Expose /download and /saved_data endpoints
 ESP32_DEVICE_NAME = "ESP32-PPG-Glucose"
 PREPROCESSING_SERVICE_URL = os.getenv("PREPROCESSING_SERVICE_URL", "http://localhost:8001")
 UI_SERVICE_URL = os.getenv("UI_SERVICE_URL", "http://localhost:8003")
-TOTAL_SAMPLES = 9000  # 180 seconds × 50 Hz (optimal for smooth PPG + accurate respiratory)
+TOTAL_SAMPLES = 6000  # 100 seconds × 50 Hz (optimal for smooth PPG + accurate respiratory)
 
 # Data storage configuration
 DATA_STORAGE_DIR = Path("ppg_data")  # Directory to store collected data
@@ -56,7 +56,7 @@ main_event_loop: asyncio.AbstractEventLoop | None = None
 collection_metadata = {
     "start_time": None,
     "end_time": None,
-    "sample_rate": 100,
+    "sample_rate": 200,
     "duration_seconds": 60,
     "device_name": ESP32_DEVICE_NAME,
     "last_saved_file": None
@@ -92,6 +92,19 @@ async def post_with_retry(client: httpx.AsyncClient, url: str, json=None, retrie
             logger.exception(f"Unexpected error during POST attempt {attempt}: {e}")
             raise
 
+
+
+def _response_to_dict(resp: object) -> dict:
+    """Convert an httpx.Response with status 200 to a dict without calling .json().
+    Falls back to {"success": False}.
+    """
+    try:
+        if isinstance(resp, httpx.Response) and getattr(resp, "status_code", None) == 200:
+            text = getattr(resp, "text", "") or "{}"
+            return json.loads(text)
+    except Exception:
+        pass
+    return {"success": False}
 
 class CollectionRequest(BaseModel):
     action: str
@@ -487,8 +500,8 @@ async def save_and_process_data():
     Streamlined workflow:
     1. Convert & unscale
     2. SAVE data to disk (if ENABLE_CSV_SAVE=True)
-    3. Send to preprocessing /preprocess_combined
-    4. Preprocessing handles model inference, respiratory analysis, and UI update
+    3. Run /preprocess and /preprocess_respiratory in parallel
+    4. Merge results and notify UI
     """
     global ppg_buffer, collection_status
 
@@ -552,48 +565,119 @@ async def save_and_process_data():
         else:
             logger.info("CSV saving disabled (ENABLE_CSV_SAVE=False)")
         
-    # Step 4: Send to preprocessing /preprocess_combined (pass effective sampling_rate)
-        logger.info("Sending data to preprocessing service /preprocess_combined...")
-        logger.info("Preprocessing will run glucose+respiratory in parallel and notify UI")
-        
+    # Step 4: Run glucose and respiratory preprocessing in parallel, then notify UI
+        logger.info("Sending data to preprocessing service: /preprocess and /preprocess_respiratory in parallel...")
+
         async with httpx.AsyncClient(timeout=90.0) as client:
             try:
-                preprocessing_response = await post_with_retry(
+                glucose_task = post_with_retry(
                     client,
-                    f"{PREPROCESSING_SERVICE_URL}/preprocess_combined",
+                    f"{PREPROCESSING_SERVICE_URL}/preprocess",
                     json={
                         "signal": ppg_signal.tolist(),
-                        "sampling_rate": int(round(effective_fs)),
-                        "csv_file": csv_file_path
                     },
                     retries=3,
                     backoff=1.0,
                 )
-                
-                if preprocessing_response.status_code == 200:
-                    result = preprocessing_response.json()
-                    logger.info(f"✓ Combined preprocessing complete!")
-                    logger.info(f"  - Glucose: {result.get('glucose')} mg/dL")
-                    logger.info(f"  - Segments: {result.get('num_segments')}")
-                    logger.info(f"  - Respiratory Rate: {result.get('resp_rate_bpm')} bpm")
-                    logger.info(f"  - UI notified by preprocessing service")
-                    
-                    with state_lock:
-                        collection_status = "COMPLETE"
-                    
-                    return {
-                        "success": True,
-                        "preprocessing_result": result,
-                        "csv_file": csv_file_path
-                    }
-                else:
-                    logger.error(f"Preprocessing returned status {preprocessing_response.status_code}: {preprocessing_response.text}")
-                    with state_lock:
-                        collection_status = "COMPLETE_WITH_WARNINGS"
-                    return {"success": False, "error": f"Status {preprocessing_response.status_code}"}
-                    
+                resp_task = post_with_retry(
+                    client,
+                    f"{PREPROCESSING_SERVICE_URL}/preprocess_respiratory",
+                    json={
+                        "signal": ppg_signal.tolist(),
+                        "sampling_rate": int(round(effective_fs)),
+                    },
+                    retries=3,
+                    backoff=1.0,
+                )
+
+                glucose_response, resp_response = await asyncio.gather(glucose_task, resp_task, return_exceptions=True)
+
+                # Basic error handling (runtime-safe and type-checker-friendly)
+                glucose_json = {"success": False}
+                if isinstance(glucose_response, Exception):
+                    logger.error(f"Glucose preprocessing exception: {glucose_response}")
+                elif isinstance(glucose_response, httpx.Response):
+                    status = getattr(glucose_response, "status_code", None)
+                    if status == 200:
+                        glucose_json = _response_to_dict(glucose_response)
+                    else:
+                        txt = getattr(glucose_response, "text", "")
+                        logger.error(f"Glucose preprocessing returned {status}: {txt}")
+
+                resp_json = {"success": False}
+                if isinstance(resp_response, Exception):
+                    logger.error(f"Respiratory preprocessing exception: {resp_response}")
+                elif isinstance(resp_response, httpx.Response):
+                    status = getattr(resp_response, "status_code", None)
+                    if status == 200:
+                        resp_json = _response_to_dict(resp_response)
+                    else:
+                        txt = getattr(resp_response, "text", "")
+                        logger.error(f"Respiratory preprocessing returned {status}: {txt}")
+
+                # Build unified result for UI
+                dt_ms = 1000.0 / float(int(round(effective_fs)) if effective_fs else 100.0)
+                timestamps_ms = [i * dt_ms for i in range(len(ppg_signal))]
+                glucose_value = glucose_json.get("glucose") if isinstance(glucose_json, dict) else None
+                model_device = glucose_json.get("model_device") if isinstance(glucose_json, dict) else None
+
+                combined = {
+                    "success": True,
+                    # Glucose
+                    "glucose": glucose_value,
+                    "num_segments": int(glucose_json.get("num_segments", 0) or 0),
+                    "quality_score": float(glucose_json.get("quality_score", 0.0) or 0.0),
+                    # Respiratory
+                    "resp_rate_bpm": resp_json.get("resp_rate_bpm"),
+                    "resp_freq_hz": resp_json.get("resp_freq_hz"),
+                    "esqi": resp_json.get("esqi"),
+                    "entropy": resp_json.get("entropy"),
+                    "peaks_count": int(resp_json.get("peaks_count", 0) or 0),
+                    "method_used": resp_json.get("method_used"),
+                    "freqs": resp_json.get("freqs"),
+                    "psd": resp_json.get("psd"),
+                    # Raw signal and timestamps for UI plotting
+                    "raw_signal": ppg_signal.tolist(),
+                    "timestamps_ms": timestamps_ms,
+                    # Metadata
+                    "device": model_device or "receiver",
+                    "csv_file": csv_file_path,
+                }
+
+                # Notify UI
+                try:
+                    ui_resp = await post_with_retry(
+                        client,
+                        f"{UI_SERVICE_URL}/update_result",
+                        json=combined,
+                        retries=2,
+                        backoff=0.5,
+                    )
+                    if isinstance(ui_resp, httpx.Response):
+                        if getattr(ui_resp, "status_code", None) == 200:
+                            logger.info("✓ UI updated with combined result")
+                        else:
+                            logger.warning("UI update did not return 200")
+                    else:
+                        logger.warning("UI update call did not return a Response object")
+                except Exception as ui_e:
+                    logger.warning(f"Failed to update UI: {ui_e}")
+
+                logger.info("✓ Parallel preprocessing complete")
+                logger.info(f"  - Segments: {combined['num_segments']}")
+                logger.info(f"  - Respiratory Rate: {combined.get('resp_rate_bpm')} bpm")
+
+                with state_lock:
+                    collection_status = "COMPLETE"
+
+                return {
+                    "success": True,
+                    "preprocessing_result": combined,
+                    "csv_file": csv_file_path,
+                }
+
             except Exception as e:
-                logger.error(f"Preprocessing request failed after retries: {e}")
+                logger.error(f"Preprocessing requests failed: {e}")
                 with state_lock:
                     collection_status = "ERROR"
                 return {"success": False, "error": str(e)}

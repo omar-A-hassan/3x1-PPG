@@ -24,9 +24,9 @@
 #define I2C_SDA 21
 #define I2C_SCL 22
 
-#define SAMPLING_RATE 100  // True 100 Hz for better glucose segmentation
-#define COLLECTION_TIME 90  // 90 seconds for 9000 samples
-#define TOTAL_SAMPLES 9000  // Fixed target: 9000 samples
+#define SAMPLING_RATE 200  
+#define COLLECTION_TIME 100  // 90 seconds for 9000 samples
+#define TOTAL_SAMPLES 6000  // Fixed target: 9000 samples
 #define SAMPLE_INTERVAL_MS (1000 / SAMPLING_RATE)
 
 // WiFi Configuration (Choose one)
@@ -261,7 +261,7 @@ void setup() {
   byte ledBrightness = 0x1F;   // Options: 0=Off to 255=50mA
   byte sampleAverage = 4;      // Hardware averaging: 4 samples @ 400 Hz → 100 Hz output (~6dB SNR)
   byte ledMode = 2;            // Red + IR mode
-  int sampleRate = 400;        // Sensor ADC samples at 400 Hz, averages to 100 Hz
+  int sampleRate = 200;        // Sensor ADC samples at 400 Hz, averages to 100 Hz
   int pulseWidth = 411;        // 411 µs LED pulse (good SNR without saturation)
   int adcRange = 16384;        // 16-bit ADC range
 
@@ -269,8 +269,6 @@ void setup() {
   particleSensor.setPulseAmplitudeRed(0x0A);
   particleSensor.setPulseAmplitudeIR(0x1F);
   particleSensor.clearFIFO();
-
-  Serial.println("Sensor configured: 400 Hz ADC → 4× averaging → 100 Hz output (Config C - Glucose Optimized)");
 
   // Initialize WiFi
   initWiFi();
@@ -294,7 +292,7 @@ void setup() {
   if (err != ESP_OK) {
     Serial.printf("ERROR: Failed to create esp_timer: %d\n", err);
   } else {
-    Serial.println("esp_timer created successfully (100 Hz = 10ms period, will start on finger detect)");
+    Serial.println("esp_timer created successfully (50 Hz = 5ms period, will start on finger detect)");
   }
 }
 

@@ -3,7 +3,7 @@
 # Version 2.0 - Tested and Working
 
 param(
-    [switch]$SkipNgrok = $false
+    [switch]$SkipNgrok = $true
 )
 
 $ErrorActionPreference = "Continue"
@@ -236,7 +236,7 @@ Write-Host "Next Steps:" -ForegroundColor Cyan
 Write-Host "  1. Check Gradio UI opened in browser" -ForegroundColor White
 Write-Host "  2. Connect ESP32 WiFi (ESP32-PPG-Glucose)" -ForegroundColor White
 Write-Host "  3. Click 'Start Collection' in UI" -ForegroundColor White
-Write-Host "  4. Place finger on sensor for 90 seconds" -ForegroundColor White
+Write-Host "  4. Place finger on sensor for 120 seconds" -ForegroundColor White
 Write-Host ""
 Write-Host "To Stop Services:" -ForegroundColor Yellow
 Write-Host "  Close all PowerShell windows or run: .\stop.ps1" -ForegroundColor White

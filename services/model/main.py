@@ -23,7 +23,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Model Service")
-app = FastAPI(title="Model Service")
 
 # UI callback endpoint (env override for local runs)
 UI_SERVICE_URL = os.getenv("UI_SERVICE_URL", "http://localhost:8003")
@@ -180,6 +179,7 @@ model_inference = None
 
 @app.on_event("startup")
 async def startup_event():
+    """Initialize model on startup"""
     global model_inference
     model_path = Path(r"C:\Users\nazeh\BioInfo Trials\3x1-PPG\Dev\3x1-PPG\services\model\best_model.pt")
 
@@ -188,45 +188,16 @@ async def startup_event():
         raise FileNotFoundError(f"Model file not found: {model_path}")
 
     logger.info(f"Model file found at: {model_path}")
-
     model_inference = ModelInference(str(model_path))
     logger.info("✅ Model loaded successfully and ready for inference.")
 
-    try:
-        # ✅ Import the same model builder used in Docker
-        from src.models.ts2vec_ppg import build_tsencoder_ppg
-
-        # Build architecture (must match what was trained)
-        model = build_tsencoder_ppg(
-            input_dims=1,
-            output_dims=320,
-            hidden_dims=64,
-            depth=10,
-            dropout=0.1
-        )
-
-        checkpoint = torch.load(model_path, map_location=torch.device("cpu"))
-
-        # Handle different checkpoint formats
-        if "model_state_dict" in checkpoint:
-            model.load_state_dict(checkpoint["model_state_dict"])
-        elif "state_dict" in checkpoint:
-            model.load_state_dict(checkpoint["state_dict"])
-        else:
-            model.load_state_dict(checkpoint)
-
-        model.eval()  # ready for inference
-
-    except Exception as e:
-        logger.error(f"Failed to load model: {e}", exc_info=True)
-        raise RuntimeError(f"Failed to load model: {e}")
-
 @app.get("/")
 async def root():
+    """Root endpoint with service status"""
     return {
         "service": "Model Service",
-        "status": "ready",
-        "device": str(next(model_inference.parameters()).device) if model_inference else "not initialized"
+        "status": "ready" if model_inference else "not initialized",
+        "device": str(model_inference.device) if model_inference else "unknown"
     }
 
 @app.get("/health")
@@ -298,15 +269,9 @@ async def predict(request: PredictRequest):
             )
         
         # Run inference
-        logger.info("About to call model_inference.predict...")
-        try:
-            glucose_pred = model_inference.predict(segments)
-            logger.info(f"Prediction successful: {glucose_pred:.2f} mg/dL")
-        except Exception as pred_error:
-            logger.error(f"Prediction failed: {pred_error}", exc_info=True)
-            raise HTTPException(status_code=500, detail=f"Prediction failed: {str(pred_error)}")
+        glucose_pred = model_inference.predict(segments)
+        logger.info(f"Prediction successful: {glucose_pred:.2f} mg/dL")
 
-        # Return prediction result (Preprocessing will aggregate and send to UI)
         return PredictResponse(
             success=True,
             glucose_prediction=glucose_pred,
@@ -315,6 +280,8 @@ async def predict(request: PredictRequest):
             device=str(model_inference.device)
         )
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Prediction failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))

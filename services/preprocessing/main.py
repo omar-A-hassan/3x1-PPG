@@ -1,9 +1,7 @@
-"""
-Preprocessing Service - CORRECTED VERSION
-(Removed incorrect UI update code)
-"""
+"""Preprocessing Service"""
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import httpx
 import numpy as np
@@ -11,7 +9,7 @@ from scipy import signal
 import logging
 from typing import List, Optional, Tuple
 import os
-import asyncio
+from functools import wraps
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -20,7 +18,31 @@ app = FastAPI(title="Preprocessing Service")
 
 # Allow overriding model URL when running locally vs docker-compose
 MODEL_SERVICE_URL = os.getenv("MODEL_SERVICE_URL", "http://localhost:8002")
-UI_SERVICE_URL = os.getenv("UI_SERVICE_URL", "http://localhost:8003")
+
+
+# ============================================================================
+# ERROR HANDLING DECORATOR
+# ============================================================================
+
+def handle_preprocessing_errors(operation_name: str):
+    """Decorator to standardize error handling across preprocessing endpoints.
+    
+    Args:
+        operation_name: Name of the operation for logging (e.g., "Preprocessing", "Respiratory preprocessing")
+        
+    Returns:
+        Decorator that wraps endpoint functions with consistent error handling
+    """
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            try:
+                return await func(*args, **kwargs)
+            except Exception as e:
+                logger.error(f"{operation_name} failed: {e}", exc_info=True)
+                raise HTTPException(status_code=500, detail=str(e))
+        return wrapper
+    return decorator
 
 class PreprocessRequest(BaseModel):
     signal: List[float]
@@ -30,6 +52,8 @@ class PreprocessResponse(BaseModel):
     num_segments: int
     segments: Optional[List[List[float]]] = None
     quality_score: float
+    glucose: Optional[float] = None
+    model_device: Optional[str] = None
     error: Optional[str] = None
 
 # --- Respiratory pipeline schemas ---
@@ -57,35 +81,9 @@ class RespiratoryPreprocessResponse(BaseModel):
     psd: Optional[List[float]] = None
     error: Optional[str] = None
 
-# --- Combined pipeline schemas ---
-class PreprocessCombinedRequest(BaseModel):
-    signal: List[float]
-    sampling_rate: float = 100.0
-    csv_file: Optional[str] = None  # For reference/logging only
-
-class PreprocessCombinedResponse(BaseModel):
-    success: bool
-    # Glucose fields
-    glucose: Optional[float] = None
-    num_segments: int = 0
-    quality_score: float = 0.0
-    # Respiratory fields
-    resp_rate_bpm: Optional[float] = None
-    resp_freq_hz: Optional[float] = None
-    esqi: Optional[float] = None
-    entropy: Optional[float] = None
-    peaks_count: int = 0
-    method_used: Optional[str] = None
-    # PSD for respiratory plot
-    freqs: Optional[List[float]] = None
-    psd: Optional[List[float]] = None
-    # Raw signal and timestamps for UI plotting
-    raw_signal: Optional[List[float]] = None
-    timestamps_ms: Optional[List[float]] = None
-    # Metadata
-    device: str = "preprocessing"
-    csv_file: Optional[str] = None
-    error: Optional[str] = None
+# ---------------------------------------------------------------------------
+            # PPG Preprocessor initialization / All parameters
+# ---------------------------------------------------------------------------
 
 class PPGPreprocessor:
     """
@@ -94,7 +92,7 @@ class PPGPreprocessor:
 
     def __init__(
         self,
-        sampling_rate=100,
+        sampling_rate=50,
         segment_length=1.0,
         lowcut=0.4,  # Relaxed from 0.5 to 0.4 Hz for better 50-100 Hz compatibility
         highcut=8.0,
@@ -105,7 +103,7 @@ class PPGPreprocessor:
         # Respiratory-focused extras
         resp_lowcut=0.1,
         resp_highcut=0.4,
-        rb: float = 1.0,
+        rb: float = 1,
         l_lt: float = 0.0,
         hampel_window_size: int = 15,
         hampel_threshold: float = 3.0,
@@ -150,25 +148,41 @@ class PPGPreprocessor:
 
         return ppg
 
-    def bandpass_filter(self, ppg_signal):
+    def bandpass_filter(
+        self,
+        ppg_signal,
+        lowcut: Optional[float] = None,
+        highcut: Optional[float] = None,
+        mode: str = "heart",
+    ):
+        """Generic bandpass filter for PPG.
+        Args:
+            ppg_signal: array-like PPG samples.
+            lowcut: optional low cutoff in Hz; if None uses defaults per mode.
+            highcut: optional high cutoff in Hz; if None uses defaults per mode.
+            mode: 'heart' to use (self.lowcut, self.highcut) or 'resp' to use
+                  (self.resp_lowcut, self.resp_highcut). Custom low/high override mode.
+        Returns:
+            np.ndarray filtered signal, or None on failure.
+        """
+        # Resolve band
+        if lowcut is None or highcut is None:
+            if mode == "resp":
+                lc = self.resp_lowcut if lowcut is None else lowcut
+                hc = self.resp_highcut if highcut is None else highcut
+            else:
+                lc = self.lowcut if lowcut is None else lowcut
+                hc = self.highcut if highcut is None else highcut
+        else:
+            lc, hc = lowcut, highcut
+
         nyquist = 0.5 * self.sampling_rate
-        low = self.lowcut / nyquist
-        high = self.highcut / nyquist
+        low = float(lc) / nyquist
+        high = float(hc) / nyquist
 
-        b, a = signal.butter(self.filter_order, [low, high], btype='band')
-
-        try:
-            filtered_signal = signal.filtfilt(b, a, ppg_signal)
-        except ValueError:
+        # Guard against invalid normalized frequencies
+        if not (0.0 < low < high < 1.0):
             return None
-
-        return filtered_signal
-
-    def bandpass_filter_resp(self, ppg_signal):
-        """Bandpass for respiratory component (defaults 0.1–0.4 Hz)."""
-        nyquist = 0.5 * self.sampling_rate
-        low = self.resp_lowcut / nyquist
-        high = self.resp_highcut / nyquist
 
         b, a = signal.butter(self.filter_order, [low, high], btype='band')
         try:
@@ -242,6 +256,8 @@ class PPGPreprocessor:
             return np.array([])
 
         return np.array(filtered_windows)
+
+    # --------- Omar PPG pipeline ---------
 
     def preprocess(self, ppg_signal, apply_template_matching=True):
         # Step 1: Handle missing values
@@ -424,7 +440,7 @@ class PPGPreprocessor:
         freqs: np.ndarray,
         psd: np.ndarray,
         band: Tuple[float, float] = (0.1, 0.4),
-        min_bpm: float = 10.0,
+        min_bpm: float = 6.0,
         max_bpm: float = 30.0,
         min_prom_rel: float = 0.12,
         dominance_ratio: float = 1.2,
@@ -487,499 +503,239 @@ async def root():
     return {"service": "Preprocessing Service", "status": "ready"}
 
 @app.post("/preprocess", response_model=PreprocessResponse)
+@handle_preprocessing_errors("Preprocessing")
 async def preprocess_signal(request: PreprocessRequest):
     """Preprocess PPG signal and send to model service"""
-    try:
-        logger.info(f"Received signal with {len(request.signal)} samples")
+    logger.info(f"Received signal with {len(request.signal)} samples")
 
-        # Convert to numpy
-        ppg_signal = np.array(request.signal, dtype=np.float64)
+    ppg_signal = np.array(request.signal, dtype=np.float64)
+    
+    # Initialize preprocessor with glucose-specific parameters
+    preprocessor = PPGPreprocessor(
+        sampling_rate=50,      # Hz - standard PPG sampling rate
+        lowcut=0.4             # Hz - heart-rate bandpass lower bound
+    )
+    
+    # Run full preprocessing pipeline: bandpass → peak detection → segmentation
+    segments = preprocessor.preprocess(ppg_signal, apply_template_matching=True)
 
-        # Initialize preprocessor
-        preprocessor = PPGPreprocessor(
-            sampling_rate=100,              # 100 Hz
-            segment_length=1.0,             # 1-second windows
-            lowcut=0.5,                     # ← FIXED: Was 0.1, should be 0.5 Hz
-            highcut=8.0,                    # Remove frequencies > 8 Hz
-            filter_order=4,                 # Butterworth filter order
-            peak_height_threshold=20,       # Minimum peak height (adjust if needed)
-            peak_distance_factor=0.8,       # Min distance between peaks
-            similarity_threshold=0.70       # Template matching threshold (70%)
+    if segments is None or len(segments) == 0:
+        logger.warning("No valid segments extracted")
+        return PreprocessResponse(
+            success=False,
+            num_segments=0,
+            quality_score=0.0,
+            error="No valid segments extracted"
         )
 
+    logger.info(f"Extracted {len(segments)} segments")
+    
+    # Calculate quality score based on segment count (30 segments ≈ quality score of 1.0)
+    quality_score = min(1.0, len(segments) / 30.0)
+    
+    # Convert segments to list for JSON serialization
+    segments_list = segments.tolist()
 
+    glucose_prediction: Optional[float] = None
+    model_device: Optional[str] = None
 
-        # Preprocess
-        segments = preprocessor.preprocess(ppg_signal, apply_template_matching=True)
-
-        if segments is None or len(segments) == 0:
-            logger.warning("No valid segments extracted")
-            return PreprocessResponse(
-                success=False,
-                num_segments=0,
-                quality_score=0.0,
-                error="No valid segments extracted"
+    # Forward segments to model service for glucose prediction
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            model_response = await client.post(
+                f"{MODEL_SERVICE_URL}/predict",
+                json={
+                    "segments": segments_list,
+                    "quality_score": quality_score
+                }
             )
 
-        logger.info(f"Extracted {len(segments)} segments")
+            if model_response.status_code == 200:
+                logger.info("✓ Model service processed segments")
+                try:
+                    model_payload = model_response.json()
+                    glucose_prediction = model_payload.get("glucose_prediction")
+                    model_device = model_payload.get("device")
+                    if glucose_prediction is not None:
+                        logger.info(
+                            f"Predicted glucose: {float(glucose_prediction):.1f} mg/dL"
+                        )
+                except ValueError:
+                    logger.warning("Model service returned non-JSON response")
+                except Exception as parse_error:
+                    logger.warning(f"Failed to parse model response: {parse_error}")
+            else:
+                logger.warning(f"Model service returned {model_response.status_code}")
+    except Exception as model_error:
+        # Continue anyway - preprocessing succeeded, model prediction is optional
+        logger.warning(f"Model service not available: {model_error}")
 
-        # Calculate quality score (based on number of segments)
-        quality_score = min(1.0, len(segments) / 30.0)  # Expect ~30 segments
-
-        # Convert segments to list for JSON
-        segments_list = segments.tolist()
-
-        # Send to model service (if you have one)
-        try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                model_response = await client.post(
-                    f"{MODEL_SERVICE_URL}/predict",
-                    json={
-                        "segments": segments_list,
-                        "quality_score": quality_score
-                    }
-                )
-
-                if model_response.status_code == 200:
-                    logger.info("✓ Model service processed segments")
-                else:
-                    logger.warning(f"Model service returned {model_response.status_code}")
-                    
-        except Exception as model_error:
-            logger.warning(f"Model service not available: {model_error}")
-            # Continue anyway - preprocessing succeeded
-
-        # Return preprocessing result
-        return PreprocessResponse(
-            success=True,
-            num_segments=len(segments),
-            segments=segments_list,
-            quality_score=quality_score
-        )
-
-    except Exception as e:
-        logger.error(f"Preprocessing failed: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+    return PreprocessResponse(
+        success=True,
+        num_segments=len(segments),
+        segments=segments_list,
+        quality_score=quality_score,
+        glucose=glucose_prediction,
+        model_device=model_device
+    )
 
 
 @app.post("/preprocess_respiratory", response_model=RespiratoryPreprocessResponse)
+@handle_preprocessing_errors("Respiratory preprocessing")
 async def preprocess_respiratory(request: RespiratoryPreprocessRequest):
     """
-    Respiratory-focused pipeline that:
-    1) Handles missing values
-    2) Bandpass (0.1–0.4 Hz)
+    Respiratory rate estimation pipeline:
+    1) Missing values handling
+    2) Respiratory bandpass filter (0.1-0.5 Hz)
     3) Peak enhancement
-    4) Hampel outlier removal
-    5) ESQI entropy metric
-    6) Heart-beat peak detection on HEART BAND (0.5–8 Hz) to form IBIs
-    7) Resample IBI series to even grid and compute Welch PSD
-    8) RespR = argmax PSD within [0.1, 0.4] Hz, converted to bpm
-
-    Falls back to PSD of respiratory-band filtered signal if IBI series is insufficient.
+    4) Hampel filter for outlier removal
+    5) Signal quality segmentation (eSQI)
+    6) IBI extraction from high-quality windows
+    7) PSD analysis (IBI-based if available, else signal-based)
+    8) Respiratory rate estimation from dominant frequency
+    
+    Returns: respiratory_rate (bpm), peaks_count, dominant_freq, and optional IBI/PSD arrays
     """
-    try:
-        raw = np.array(request.signal, dtype=np.float64)
-        logger.info(f"[Resp] received {raw.size} samples")
+    raw = np.array(request.signal, dtype=np.float64)
+    logger.info(f"[Resp] received {raw.size} samples")
+    
+    # Initialize preprocessor with default parameters
+    pre = PPGPreprocessor()
+    
+    # Use provided sampling rate if any
+    if request.sampling_rate is not None:
+        pre.sampling_rate = int(request.sampling_rate)
+        pre.segment_samples = int(pre.sampling_rate * pre.segment_length)
 
-        # Use provided sampling rate if any
-        pre = PPGPreprocessor()
-        if request.sampling_rate is not None:
-            pre.sampling_rate = float(request.sampling_rate)
-            pre.segment_samples = int(pre.sampling_rate * pre.segment_length)
+    # 1) Handle missing values (interpolation/removal)
+    cleaned = pre.handle_missing_values(raw)
+    if cleaned is None:
+        return RespiratoryPreprocessResponse(success=False, peaks_count=0, error="Signal invalid after missing-value handling")
+    
+    # 2) Apply respiratory bandpass filter (0.1-0.5 Hz → ~6-30 breaths/min)
+    resp_filt = pre.bandpass_filter(cleaned, mode='resp')
+    if resp_filt is None:
+        return RespiratoryPreprocessResponse(success=False, peaks_count=0, error="Respiratory bandpass failed")
+    
+    # 3) Enhance peaks for better detection
+    enhanced = pre.peak_enhancement(resp_filt)
+    
+    # 4) Remove outliers with Hampel filter
+    denoised = pre.hampel_filter(enhanced)
+    
+    # 5) Segment signal by eSQI to identify high-quality windows
+    x_hq, windows_kept, entropy, esqi = pre.segment_by_esqi(
+        denoised,
+        fs=pre.sampling_rate,
+        window_sec=10.0,
+        step_sec=5.0,
+        esqi_thresh=0.5,
+    )
+    
+    # 6) Detect peaks in heart-rate band to extract IBIs (reuse same preprocessor instance)
+    heart_band = pre.bandpass_filter(cleaned, mode='heart')
+    peaks = pre.detect_peaks_dynamic(heart_band) if heart_band is not None else np.array([])
+    ibi_t, ibi = pre.compute_ibis(peaks, pre.sampling_rate)
+    
+    # Restrict IBIs to high-quality windows identified by eSQI
+    if len(ibi) and windows_kept:
+        keep_mask = np.zeros_like(ibi_t, dtype=bool)
+        for (s_idx, e_idx) in windows_kept:
+            t0 = s_idx / pre.sampling_rate
+            t1 = e_idx / pre.sampling_rate
+            keep_mask |= (ibi_t >= t0) & (ibi_t <= t1)
+        ibi_t = ibi_t[keep_mask]
+        ibi = ibi[keep_mask]
 
-        # 1) Missing values
-        cleaned = pre.handle_missing_values(raw)
-        if cleaned is None:
-            return RespiratoryPreprocessResponse(success=False, peaks_count=0, error="Signal invalid after missing-value handling")
+    # 7a) IBI-based PSD analysis (preferred method if sufficient IBIs available)
+    method_used = "ibi-welch"
+    freqs = np.array([])
+    psd = np.array([])
+    resp_rate_bpm: Optional[float] = None
+    resp_freq_hz: Optional[float] = None
+    peak_prom: Optional[float] = None
+    dom_ratio: Optional[float] = None
+    used_fallback = False
 
-        # 2) Respiratory bandpass
-        resp_filt = pre.bandpass_filter_resp(cleaned)
-        if resp_filt is None:
-            return RespiratoryPreprocessResponse(success=False, peaks_count=0, error="Respiratory bandpass failed")
-
-        # 3) Peak enhancement
-        enhanced = pre.peak_enhancement(resp_filt)
-
-        # 4) Hampel filter
-        denoised = pre.hampel_filter(enhanced)
-
-        # 5) ESQI from the denoised respiratory component + segmentation
-        x_hq, windows_kept, entropy, esqi = pre.segment_by_esqi(
-            denoised,
-            fs=pre.sampling_rate,
-            window_sec=10.0,
-            step_sec=5.0,
-            esqi_thresh=0.5,
-        )
-
-        # 6) Heart-beat oriented peak detection on HEART BAND to get IBIs
-        pre_heart = PPGPreprocessor(sampling_rate=pre.sampling_rate)
-        heart_band = pre_heart.bandpass_filter(cleaned)
-        peaks = pre.detect_peaks_dynamic(heart_band) if heart_band is not None else np.array([])
-
-        # restrict IBIs to high-quality windows (midpoint must lie in any kept window)
-        ibi_t, ibi = pre.compute_ibis(peaks, pre.sampling_rate)
-        if len(ibi) and windows_kept:
-            keep_mask = np.zeros_like(ibi_t, dtype=bool)
-            for (s_idx, e_idx) in windows_kept:
-                t0 = s_idx / pre.sampling_rate
-                t1 = e_idx / pre.sampling_rate
-                keep_mask |= (ibi_t >= t0) & (ibi_t <= t1)
-            ibi_t = ibi_t[keep_mask]
-            ibi = ibi[keep_mask]
-
-        method_used = "ibi-welch"
-        freqs = np.array([])
-        psd = np.array([])
-        resp_rate_bpm: Optional[float] = None
-        resp_freq_hz: Optional[float] = None
-        peak_prom: Optional[float] = None
-        dom_ratio: Optional[float] = None
-        used_fallback = False
-
-        if len(ibi) >= 8:
-            t_even, ibi_even, fs_even = pre.resample_series(ibi_t, ibi, pre.ibi_resample_hz)
-            freqs, psd = pre.welch_psd(ibi_even - np.mean(ibi_even), fs_even)
-            if freqs.size and psd.size:
-                rr_bpm, rr_hz, prom, dom = pre.select_resp_peak(
-                    freqs,
-                    psd,
-                    band=(pre.resp_lowcut, pre.resp_highcut),
-                    min_bpm=10.0,
-                    max_bpm=30.0,
-                    min_prom_rel=0.12,
-                    dominance_ratio=1.2,
-                )
-                resp_rate_bpm, resp_freq_hz = rr_bpm, rr_hz
-                peak_prom, dom_ratio = prom, dom
-
-        # 7b) Fallback: use the respiratory-band signal directly (prefer HQ windows)
-        if resp_rate_bpm is None:
-            method_used = "resp-signal-welch"
-            used_fallback = True
-            base = x_hq if x_hq.size else denoised
-            freqs, psd = pre.welch_psd(base - np.mean(base), pre.sampling_rate)
-            if freqs.size and psd.size:
-                rr_bpm, rr_hz, prom, dom = pre.select_resp_peak(
-                    freqs,
-                    psd,
-                    band=(pre.resp_lowcut, pre.resp_highcut),
-                    min_bpm=10.0,
-                    max_bpm=30.0,
-                    min_prom_rel=0.12,
-                    dominance_ratio=1.2,
-                )
-                resp_rate_bpm, resp_freq_hz = rr_bpm, rr_hz
-                peak_prom, dom_ratio = prom, dom
-
-        # Last-chance naive argmax if robust selector rejected near-equal peaks
-        if resp_rate_bpm is None and freqs.size and psd.size:
-            naive_bpm, naive_hz = pre.resp_rate_from_psd(freqs, psd, band=(pre.resp_lowcut, pre.resp_highcut))
-            resp_rate_bpm = resp_rate_bpm or naive_bpm
-            resp_freq_hz = resp_freq_hz or naive_hz
-
-        if resp_rate_bpm is None:
-            return RespiratoryPreprocessResponse(
-                success=False,
-                peaks_count=int(len(peaks)),
-                esqi=float(esqi),
-                entropy=float(entropy),
-                error="Unable to estimate respiratory rate"
+    if len(ibi) >= 8:
+        # Resample IBI time series to uniform sampling rate
+        t_even, ibi_even, fs_even = pre.resample_series(ibi_t, ibi, pre.ibi_resample_hz)
+        
+        # Compute power spectral density via Welch's method
+        freqs, psd = pre.welch_psd(ibi_even - np.mean(ibi_even), fs_even)
+        
+        if freqs.size and psd.size:
+            # Select respiratory peak in PSD within expected frequency band
+            rr_bpm, rr_hz, prom, dom = pre.select_resp_peak(
+                freqs,
+                psd,
+                band=(pre.resp_lowcut, pre.resp_highcut),
+                min_bpm=6,
+                max_bpm=30.0,
+                min_prom_rel=0.12,
+                dominance_ratio=1.2,
             )
+            resp_rate_bpm, resp_freq_hz = rr_bpm, rr_hz
+            peak_prom, dom_ratio = prom, dom
 
-        # Trim PSD vectors if very long to keep response size sane
-        MAX_PSD_POINTS = 2048
-        if freqs.size > MAX_PSD_POINTS:
-            idx = np.linspace(0, freqs.size - 1, MAX_PSD_POINTS).astype(int)
-            freqs_out = freqs[idx].tolist()
-            psd_out = psd[idx].tolist()
-        else:
-            freqs_out = freqs.tolist()
-            psd_out = psd.tolist()
+    # 7b) Fallback: signal-based PSD if IBI-based method failed
+    if resp_rate_bpm is None:
+        method_used = "resp-signal-welch"
+        used_fallback = True
+        base = x_hq if x_hq.size else denoised
+        freqs, psd = pre.welch_psd(base - np.mean(base), pre.sampling_rate)
+        if freqs.size and psd.size:
+            rr_bpm, rr_hz, prom, dom = pre.select_resp_peak(
+                freqs,
+                psd,
+                band=(pre.resp_lowcut, pre.resp_highcut),
+                min_bpm=10.0,
+                max_bpm=30.0,
+                min_prom_rel=0.12,
+                dominance_ratio=1.2,
+            )
+            resp_rate_bpm, resp_freq_hz = rr_bpm, rr_hz
+            peak_prom, dom_ratio = prom, dom
 
+    # 7c) Last-chance fallback: naive argmax on PSD if previous methods failed
+    if resp_rate_bpm is None and freqs.size and psd.size:
+        naive_bpm, naive_hz = pre.resp_rate_from_psd(freqs, psd, band=(pre.resp_lowcut, pre.resp_highcut))
+        resp_rate_bpm = resp_rate_bpm or naive_bpm
+        resp_freq_hz = resp_freq_hz or naive_hz
+
+    if resp_rate_bpm is None:
         return RespiratoryPreprocessResponse(
-            success=True,
-            resp_rate_bpm=float(resp_rate_bpm),
-            resp_freq_hz=float(resp_freq_hz) if resp_freq_hz is not None else None,
+            success=False,
+            peaks_count=int(len(peaks)),
             esqi=float(esqi),
             entropy=float(entropy),
-            peaks_count=int(len(peaks)),
-            method_used=method_used,
-            peak_prominence=peak_prom,
-            dominance_ratio=dom_ratio,
-            used_fallback=used_fallback,
-            freqs=freqs_out,
-            psd=psd_out,
+            error="Unable to estimate respiratory rate"
         )
-    except Exception as e:
-        logger.error(f"Respiratory preprocessing failed: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
 
+    # Trim PSD vectors to prevent excessive payload size (limit to 2048 points)
+    MAX_PSD_POINTS = 2048
+    if freqs.size > MAX_PSD_POINTS:
+        idx = np.linspace(0, freqs.size - 1, MAX_PSD_POINTS).astype(int)
+        freqs_out = freqs[idx].tolist()
+        psd_out = psd[idx].tolist()
+    else:
+        freqs_out = freqs.tolist()
+        psd_out = psd.tolist()
 
-@app.post("/preprocess_combined", response_model=PreprocessCombinedResponse)
-async def preprocess_combined(request: PreprocessCombinedRequest):
-    """
-    Combined endpoint: runs BOTH glucose and respiratory pipelines in parallel.
-    Returns unified result with all metrics + raw signal for plotting.
-    Posts complete result to UI service.
-    """
-    try:
-        logger.info(f"[Combined] Received signal with {len(request.signal)} samples")
-        
-        signal = np.array(request.signal, dtype=np.float64)
-        
-        # Prepare timestamps for plotting based on provided sampling_rate
-        dt_ms = 1000.0 / float(request.sampling_rate if request.sampling_rate else 100.0)
-        timestamps_ms = [i * dt_ms for i in range(len(signal))]
-        
-        # Run both pipelines in parallel using asyncio.gather
-        async def run_glucose_pipeline():
-            """Run glucose preprocessing and model inference"""
-            try:
-                fs = int(request.sampling_rate) if request.sampling_rate else 100
-                logger.info(f"[Glucose] Starting pipeline: fs={fs} Hz, signal_length={len(signal)} samples")
-                
-                preprocessor = PPGPreprocessor(sampling_rate=fs)
-                logger.info(f"[Glucose] Config: segment_samples={preprocessor.segment_samples}, lowcut={preprocessor.lowcut}, highcut={preprocessor.highcut}")
-                
-                # Step-by-step logging
-                cleaned = preprocessor.handle_missing_values(signal)
-                if cleaned is None:
-                    logger.warning(f"[Glucose] FAILED at missing values handling")
-                    return {"success": False, "num_segments": 0, "quality_score": 0.0, "glucose": None}
-                logger.info(f"[Glucose] After missing values: {len(cleaned)} samples, mean={np.mean(cleaned):.1f}")
-                
-                filtered = preprocessor.bandpass_filter(cleaned)
-                if filtered is None:
-                    logger.warning(f"[Glucose] FAILED at bandpass filter")
-                    return {"success": False, "num_segments": 0, "quality_score": 0.0, "glucose": None}
-                logger.info(f"[Glucose] After bandpass ({preprocessor.lowcut}-{preprocessor.highcut} Hz): std={np.std(filtered):.2f}, range=[{np.min(filtered):.1f}, {np.max(filtered):.1f}]")
-                
-                peaks = preprocessor.detect_peaks_dynamic(filtered)
-                logger.info(f"[Glucose] Peaks detected: {len(peaks)} peaks")
-                if len(peaks) == 0:
-                    logger.warning(f"[Glucose] FAILED: No peaks detected (signal too noisy or flat)")
-                    return {"success": False, "num_segments": 0, "quality_score": 0.0, "glucose": None}
-                
-                windows = preprocessor.extract_peak_centered_windows(filtered, peaks)
-                logger.info(f"[Glucose] Windows extracted: {len(windows)} windows from {len(peaks)} peaks")
-                if len(windows) == 0:
-                    logger.warning(f"[Glucose] FAILED: No valid windows (peaks too close to edges)")
-                    return {"success": False, "num_segments": 0, "quality_score": 0.0, "glucose": None}
-                
-                # Template matching
-                if len(windows) > 1:
-                    template = preprocessor.compute_template(windows)
-                    segments = preprocessor.filter_windows_by_similarity(windows, template)
-                    if len(segments) == 0:
-                        logger.warning(f"[Glucose] Template matching rejected all windows, using original {len(windows)} windows")
-                        segments = windows
-                    else:
-                        logger.info(f"[Glucose] After template matching: {len(segments)} segments (kept {len(segments)/len(windows)*100:.1f}%)")
-                else:
-                    segments = windows
-                    logger.info(f"[Glucose] Skipped template matching (only 1 window)")
-                
-                if segments is None or len(segments) == 0:
-                    logger.warning(f"[Glucose] FAILED: Zero segments after all processing")
-                    return {"success": False, "num_segments": 0, "quality_score": 0.0, "glucose": None}
-                
-                quality_score = min(1.0, len(segments) / 30.0)
-                segments_list = segments.tolist()
-                logger.info(f"[Glucose] SUCCESS: {len(segments)} segments extracted, quality={quality_score:.2f}")
-                
-                # Call model service
-                async with httpx.AsyncClient(timeout=60.0) as client:
-                    model_response = await client.post(
-                        f"{MODEL_SERVICE_URL}/predict",
-                        json={
-                            "segments": segments_list,
-                            "quality_score": quality_score
-                        }
-                    )
-                    
-                    if model_response.status_code == 200:
-                        model_data = model_response.json()
-                        return {
-                            "success": True,
-                            "glucose": model_data.get("glucose_prediction"),
-                            "num_segments": len(segments),
-                            "quality_score": quality_score
-                        }
-                    else:
-                        logger.warning(f"Model service returned {model_response.status_code}")
-                        return {"success": False, "num_segments": len(segments), "quality_score": quality_score, "glucose": None}
-                        
-            except Exception as e:
-                logger.error(f"[Combined] Glucose pipeline failed: {e}", exc_info=True)
-                return {"success": False, "num_segments": 0, "quality_score": 0.0, "glucose": None, "error": str(e)}
-        
-        async def run_respiratory_pipeline():
-            """Run respiratory analysis"""
-            try:
-                pre = PPGPreprocessor(sampling_rate=request.sampling_rate)
-                
-                # 1) Missing values
-                cleaned = pre.handle_missing_values(signal)
-                if cleaned is None:
-                    return {"success": False, "error": "Missing values handling failed"}
-                
-                # 2) Respiratory bandpass
-                resp_filt = pre.bandpass_filter_resp(cleaned)
-                if resp_filt is None:
-                    return {"success": False, "error": "Respiratory bandpass failed"}
-                # 3) Peak enhancement
-                enhanced = pre.peak_enhancement(resp_filt)
-                # 4) Hampel filter
-                denoised = pre.hampel_filter(enhanced)
-                # 5) ESQI segmentation
-                x_hq, windows_kept, entropy, esqi = pre.segment_by_esqi(
-                    denoised, fs=pre.sampling_rate, window_sec=10.0, step_sec=5.0, esqi_thresh=0.5
-                )
-                # 6) Heart-beat peak detection for IBIs
-                pre_heart = PPGPreprocessor(sampling_rate=pre.sampling_rate)
-                heart_band = pre_heart.bandpass_filter(cleaned)
-                if heart_band is None:
-                    heart_peaks = np.array([])
-                else:
-                    heart_peaks = pre.detect_peaks_dynamic(heart_band)
-                ibi_times, ibis = pre.compute_ibis(heart_peaks, pre.sampling_rate)
-                if len(ibis) and windows_kept:
-                    keep_mask = np.zeros_like(ibi_times, dtype=bool)
-                    for (s_idx, e_idx) in windows_kept:
-                        t0 = s_idx / pre.sampling_rate
-                        t1 = e_idx / pre.sampling_rate
-                        keep_mask |= (ibi_times >= t0) & (ibi_times <= t1)
-                    ibi_times = ibi_times[keep_mask]
-                    ibis = ibis[keep_mask]
-
-                # Prefer IBI route
-                if len(ibis) >= 8:
-                    t_even, ibi_even, _ = pre.resample_series(ibi_times, ibis, pre.ibi_resample_hz)
-                    freqs, psd = pre.welch_psd(ibi_even - np.mean(ibi_even), pre.ibi_resample_hz)
-                    if freqs.size and psd.size:
-                        rr_bpm, rr_hz, prom, dom = pre.select_resp_peak(
-                            freqs, psd, band=(pre.resp_lowcut, pre.resp_highcut),
-                            min_bpm=10.0, max_bpm=30.0, min_prom_rel=0.12, dominance_ratio=1.2
-                        )
-                        if rr_bpm is not None:
-                            return {
-                                "success": True,
-                                "resp_rate_bpm": rr_bpm,
-                                "resp_freq_hz": rr_hz,
-                                "esqi": esqi,
-                                "entropy": entropy,
-                                "peaks_count": int(len(heart_peaks)),
-                                "method_used": "IBI_PSD",
-                                "freqs": freqs.tolist(),
-                                "psd": psd.tolist()
-                            }
-
-                # Fallback: respiratory-band PSD using HQ windows if available
-                base = x_hq if x_hq.size else denoised
-                freqs_resp, psd_resp = pre.welch_psd(base - np.mean(base), pre.sampling_rate)
-                if freqs_resp.size and psd_resp.size:
-                    rr_bpm, rr_hz, prom, dom = pre.select_resp_peak(
-                        freqs_resp, psd_resp, band=(pre.resp_lowcut, pre.resp_highcut),
-                        min_bpm=10.0, max_bpm=30.0, min_prom_rel=0.12, dominance_ratio=1.2
-                    )
-                    if rr_bpm is not None:
-                        return {
-                            "success": True,
-                            "resp_rate_bpm": rr_bpm,
-                            "resp_freq_hz": rr_hz,
-                            "esqi": esqi,
-                            "entropy": entropy,
-                            "peaks_count": int(len(heart_peaks)),
-                            "method_used": "RESP_BAND_PSD",
-                            "freqs": freqs_resp.tolist(),
-                            "psd": psd_resp.tolist()
-                        }
-                # Last-chance naive argmax
-                if freqs_resp.size and psd_resp.size:
-                    naive_bpm, naive_hz = pre.resp_rate_from_psd(freqs_resp, psd_resp, band=(pre.resp_lowcut, pre.resp_highcut))
-                    if naive_bpm is not None:
-                        return {
-                            "success": True,
-                            "resp_rate_bpm": naive_bpm,
-                            "resp_freq_hz": naive_hz,
-                            "esqi": esqi,
-                            "entropy": entropy,
-                            "peaks_count": int(len(heart_peaks)),
-                            "method_used": "RESP_BAND_PSD_NAIVE",
-                            "freqs": freqs_resp.tolist(),
-                            "psd": psd_resp.tolist()
-                        }
-                return {"success": False, "error": "PSD computation failed"}
-                
-            except Exception as e:
-                logger.error(f"[Combined] Respiratory pipeline failed: {e}", exc_info=True)
-                return {"success": False, "error": str(e)}
-        
-        # Execute both pipelines in parallel
-        logger.info("[Combined] Running glucose and respiratory pipelines in parallel...")
-        glucose_result, resp_result = await asyncio.gather(
-            run_glucose_pipeline(),
-            run_respiratory_pipeline(),
-            return_exceptions=True
-        )
-        
-        # Handle exceptions from gather
-        if isinstance(glucose_result, Exception):
-            logger.error(f"[Combined] Glucose pipeline exception: {glucose_result}")
-            glucose_result = {"success": False, "num_segments": 0, "quality_score": 0.0, "glucose": None}
-        
-        if isinstance(resp_result, Exception):
-            logger.error(f"[Combined] Respiratory pipeline exception: {resp_result}")
-            resp_result = {"success": False}
-        
-        # Build unified response
-        combined = PreprocessCombinedResponse(
-            success=True,
-            # Glucose
-            glucose=glucose_result.get("glucose"),
-            num_segments=glucose_result.get("num_segments", 0),
-            quality_score=glucose_result.get("quality_score", 0.0),
-            # Respiratory
-            resp_rate_bpm=resp_result.get("resp_rate_bpm"),
-            resp_freq_hz=resp_result.get("resp_freq_hz"),
-            esqi=resp_result.get("esqi"),
-            entropy=resp_result.get("entropy"),
-            peaks_count=resp_result.get("peaks_count", 0),
-            method_used=resp_result.get("method_used"),
-            freqs=resp_result.get("freqs"),
-            psd=resp_result.get("psd"),
-            # Plotting data
-            raw_signal=signal.tolist(),
-            timestamps_ms=timestamps_ms,
-            # Metadata
-            device="preprocessing",
-            csv_file=request.csv_file
-        )
-        
-        logger.info(f"[Combined] Glucose: {combined.glucose}, RespRate: {combined.resp_rate_bpm}")
-        
-        # POST unified result to UI
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                ui_response = await client.post(
-                    f"{UI_SERVICE_URL}/update_result",
-                    json=combined.dict()
-                )
-                
-                if ui_response.status_code == 200:
-                    logger.info("[Combined] Successfully sent unified result to UI")
-                else:
-                    logger.warning(f"[Combined] UI service update failed: {ui_response.text}")
-                    
-        except Exception as ui_error:
-            logger.warning(f"[Combined] Failed to send to UI service: {ui_error}")
-        
-        return combined
-        
-    except Exception as e:
-        logger.error(f"[Combined] Combined preprocessing failed: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+    return RespiratoryPreprocessResponse(
+        success=True,
+        resp_rate_bpm=float(resp_rate_bpm),
+        resp_freq_hz=float(resp_freq_hz) if resp_freq_hz is not None else None,
+        esqi=float(esqi),
+        entropy=float(entropy),
+        peaks_count=int(len(peaks)),
+        method_used=method_used,
+        peak_prominence=peak_prom,
+        dominance_ratio=dom_ratio,
+        used_fallback=used_fallback,
+        freqs=freqs_out,
+        psd=psd_out,
+    )
 
 
 if __name__ == "__main__":
