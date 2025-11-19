@@ -26,7 +26,7 @@
 
 #define SAMPLING_RATE 200  
 #define COLLECTION_TIME 100  // 90 seconds for 9000 samples
-#define TOTAL_SAMPLES 6000  // Fixed target: 9000 samples
+#define TOTAL_SAMPLES 3000  // Fixed target: 9000 samples
 #define SAMPLE_INTERVAL_MS (1000 / SAMPLING_RATE)
 
 // WiFi Configuration (Choose one)
@@ -68,6 +68,8 @@ esp_timer_handle_t sampleTimer = NULL;
 volatile bool sampleFlag = false;
 volatile uint32_t isrTickCount = 0;
 volatile uint64_t timerStartMicros = 0;  // Track actual start time for duration
+const int warmup_ms = 3000;  // Wait till IR readings stabilize
+
 
 void IRAM_ATTR onSampleTimer(void* arg) {
   sampleFlag = true;
@@ -292,7 +294,7 @@ void setup() {
   if (err != ESP_OK) {
     Serial.printf("ERROR: Failed to create esp_timer: %d\n", err);
   } else {
-    Serial.println("esp_timer created successfully (50 Hz = 5ms period, will start on finger detect)");
+    Serial.println("esp_timer created successfully (50 Hz = 20ms period, will start on finger detect)");
   }
 }
 
@@ -333,9 +335,13 @@ void handleWaitingForFinger() {
   uint32_t irValue = particleSensor.getIR();
 
   if (irValue > MIN_IR_THRESHOLD && irValue < MAX_IR_THRESHOLD) {
+
     Serial.println("Finger detected! Starting collection...");
+    Serial.println("Warming up sensor please wait...");
+    delay(warmup_ms); 
     sendStatus("COLLECTING");
     currentState = COLLECTING;
+    particleSensor.clearFIFO();
     collectionStartTime = millis();
     sampleIndex = 0;
     samplesCollected = 0;
@@ -435,6 +441,19 @@ void handleCollecting() {
                     poorQualitySamples,
                     (float)poorQualitySamples / samplesCollected * 100.0);
       Serial.println("==========================\n");
+
+      // Send timing metadata to Python
+      StaticJsonDocument<256> doc;
+      doc["event"] = "collection_complete";
+      doc["samples_collected"] = samplesCollected;
+      doc["duration_seconds"] = collectionDuration;
+      doc["actual_sample_rate"] = actualRate;
+      doc["poor_quality_count"] = poorQualitySamples;
+      
+      String jsonStr;
+      serializeJson(doc, jsonStr);
+      webSocket.sendTXT(connectedClientNum, jsonStr);
+      Serial.println("Sent timing metadata to Python");
 
       sendStatus("TRANSMITTING");
       currentState = TRANSMITTING;

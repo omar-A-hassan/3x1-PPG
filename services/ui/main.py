@@ -29,7 +29,7 @@ app = FastAPI(title="UI Service")
 # ============================================================================
 # DEBUG/DEPLOYMENT CONFIGURATION
 # ============================================================================
-ENABLE_CSV_FALLBACK = False  # Download CSV if raw_signal missing from response
+ENABLE_CSV_FALLBACK = True  # Download CSV if raw_signal missing from response
 # ============================================================================
 
 # Service URLs (configurable via environment variables)
@@ -398,7 +398,7 @@ def create_respiratory_psd_plot(freqs, psd, resp_freq_hz=None):
     ax.grid(True, alpha=0.3)
     
     # Highlight respiratory band (0.1-0.4 Hz)
-    ax.axvspan(0.1, 0.4, alpha=0.2, color='green', label='Respiratory Band')
+    ax.axvspan(0.1, 0.6, alpha=0.2, color='green', label='Respiratory Band')
     
     # Mark detected respiratory frequency
     if resp_freq_hz is not None and len(freqs) > 0:

@@ -28,15 +28,15 @@ app = FastAPI(title="WebSocket Receiver Service")
 # ============================================================================
 # DEBUG/DEPLOYMENT CONFIGURATION
 # ============================================================================
-ENABLE_CSV_SAVE = False          # Save all 5 formats to disk (archival)
-ENABLE_DOWNLOAD_ENDPOINTS = False  # Expose /download and /saved_data endpoints
+ENABLE_CSV_SAVE = True          # Save all 5 formats to disk (archival)
+ENABLE_DOWNLOAD_ENDPOINTS = True  # Expose /download and /saved_data endpoints
 # ============================================================================
 
 # Configuration
 ESP32_DEVICE_NAME = "ESP32-PPG-Glucose"
 PREPROCESSING_SERVICE_URL = os.getenv("PREPROCESSING_SERVICE_URL", "http://localhost:8001")
 UI_SERVICE_URL = os.getenv("UI_SERVICE_URL", "http://localhost:8003")
-TOTAL_SAMPLES = 6000  # 100 seconds × 50 Hz (optimal for smooth PPG + accurate respiratory)
+TOTAL_SAMPLES = 3000  # 100 seconds × 50 Hz (optimal for smooth PPG + accurate respiratory)
 
 # Data storage configuration
 DATA_STORAGE_DIR = Path("ppg_data")  # Directory to store collected data
@@ -56,10 +56,13 @@ main_event_loop: asyncio.AbstractEventLoop | None = None
 collection_metadata = {
     "start_time": None,
     "end_time": None,
-    "sample_rate": 200,
+    "sample_rate": 50,
     "duration_seconds": 60,
     "device_name": ESP32_DEVICE_NAME,
-    "last_saved_file": None
+    "last_saved_file": None,
+    # ESP32 precise timing (received via WebSocket)
+    "esp32_duration_seconds": None,
+    "esp32_sample_rate": None,
 }
 
 state_lock = threading.Lock()
@@ -128,15 +131,24 @@ async def _startup():
     max_retries = 5
 
     for attempt in range(1, max_retries + 1):
-        try:
-            logger.info(f"[Auto-Connect] Attempt {attempt} to connect to ESP32 at {ws_url}")
-            _start_ws_thread(ws_url)
-            await asyncio.sleep(2.0)  # give connection time
-            logger.info(f"[Auto-Connect] Thread started (attempt {attempt})")
-            break
-        except Exception as e:
-            logger.warning(f"[Auto-Connect] Attempt {attempt} failed: {e}")
-            await asyncio.sleep(3)
+        if collection_status != "READY":
+            try:
+                logger.info(f"[Auto-Connect] Attempt {attempt} to connect to ESP32 at {ws_url}")
+                _start_ws_thread(ws_url)
+                await asyncio.sleep(3.0)  # Wait for connection
+            
+                # Check if actually connected
+                if collection_status == "READY":
+                    logger.info(f"[Auto-Connect] Successfully connected on attempt {attempt}")
+                    break
+                else:
+                    logger.warning(f"[Auto-Connect] Attempt {attempt} - status is {collection_status}, retrying...")
+                    disconnect_device()  # Clean up failed connection
+                    await asyncio.sleep(2)
+            except Exception as e:
+                logger.warning(f"[Auto-Connect] Attempt {attempt} failed: {e}")
+                await asyncio.sleep(3)
+        
     else:
         logger.error(f"[Auto-Connect] All {max_retries} attempts failed.")
 
@@ -166,7 +178,6 @@ async def scan_devices():
         "example_ws_url": example_ws,
         "ssid_hint": "ESP32-PPG-Glucose (AP mode)"
     }
-
 def _on_ws_open(ws):
     global collection_status
     logger.info("WebSocket connection opened")
@@ -261,6 +272,11 @@ def _on_ws_message(ws, message):
                     logger.info(f"ESP32 progress: {js.get('progress')}%")
                 elif ev == "transmission":
                     logger.info(f"Transmission progress: {js.get('progress')}")
+                elif ev == "collection_complete":
+                    # Store ESP32's precise timing metadata
+                    collection_metadata["esp32_duration_seconds"] = js.get("duration_seconds")
+                    collection_metadata["esp32_sample_rate"] = js.get("actual_sample_rate")
+                    logger.info(f"ESP32 timing: {js.get('duration_seconds'):.2f}s @ {js.get('actual_sample_rate'):.2f} Hz")
             except Exception as je:
                 logger.debug(f"Failed to parse JSON: {je}")
                 with state_lock:
@@ -341,7 +357,7 @@ async def start_collection():
             # Reset flags and set defaults; will be corrected after capture
             global save_triggered
             save_triggered = False
-            collection_metadata["sample_rate"] = 100
+            collection_metadata["sample_rate"] = 50
             collection_metadata["duration_seconds"] = 60
 
         if connected_ws_app:
@@ -520,23 +536,33 @@ async def save_and_process_data():
         ppg_signal = ppg_signal * 4
         logger.info(f"Unscaled data: mean={ppg_signal.mean():.2f}, std={ppg_signal.std():.2f}")
         
-        # Compute effective duration and sampling rate from start/end times
-        start_time = collection_metadata.get("start_time")
-        end_time = collection_metadata.get("end_time")
-        duration_seconds = None
-        if start_time and end_time:
-            try:
-                duration_seconds = max((end_time - start_time).total_seconds(), 0.0)
-            except Exception:
-                duration_seconds = None
-        if not duration_seconds or duration_seconds <= 0:
-            # Fallback: assume near 100 Hz
-            duration_seconds = float(len(ppg_signal)) / 100.0 if len(ppg_signal) > 0 else 0.0
-        effective_fs = float(len(ppg_signal)) / duration_seconds if duration_seconds > 0 else 100.0
-
-        logger.info(
-            f"[Timing] start={start_time}, end={end_time}, duration={duration_seconds:.3f}s, fs_eff={effective_fs:.2f} Hz"
-        )
+        # Use ESP32's precise timing (from esp_timer) if available, otherwise fallback to Python timestamps
+        esp32_duration = collection_metadata.get("esp32_duration_seconds")
+        esp32_rate = collection_metadata.get("esp32_sample_rate")
+        
+        if esp32_duration and esp32_rate:
+            # PREFERRED: Use ESP32's esp_timer measurements (microsecond precision)
+            duration_seconds = float(esp32_duration)
+            effective_fs = float(esp32_rate)
+            logger.info(
+                f"[Timing] Using ESP32 precise timing: duration={duration_seconds:.3f}s, fs={effective_fs:.2f} Hz"
+            )
+        else:
+            # FALLBACK: Compute from Python wall-clock timestamps (includes transmission delays)
+            start_time = collection_metadata.get("start_time")
+            end_time = collection_metadata.get("end_time")
+            duration_seconds = None
+            if start_time and end_time:
+                try:
+                    duration_seconds = max((end_time - start_time).total_seconds(), 0.0)
+                except Exception:
+                    duration_seconds = None
+            if not duration_seconds or duration_seconds <= 0:
+                duration_seconds = float(len(ppg_signal)) / 50.0 if len(ppg_signal) > 0 else 0.0
+            effective_fs = float(len(ppg_signal)) / duration_seconds if duration_seconds > 0 else 50.0
+            logger.warning(
+                f"[Timing] ESP32 timing not available, using fallback: duration={duration_seconds:.3f}s, fs={effective_fs:.2f} Hz"
+            )
 
         # Update metadata for saving and downstream services
         collection_metadata["duration_seconds"] = float(duration_seconds)
@@ -727,7 +753,6 @@ async def disconnect_device():
     logger.info("Disconnected from ESP32")
     return {"status": "disconnected"}
 
-
 # ============================================================================
 # DOWNLOAD ENDPOINTS (conditionally registered based on ENABLE_DOWNLOAD_ENDPOINTS)
 # ============================================================================
@@ -779,7 +804,6 @@ if ENABLE_DOWNLOAD_ENDPOINTS:
         )
 else:
     logger.info("Download endpoints disabled (ENABLE_DOWNLOAD_ENDPOINTS=False)")
-
 
 if __name__ == "__main__":
     import uvicorn

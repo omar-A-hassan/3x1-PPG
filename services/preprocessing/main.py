@@ -10,6 +10,7 @@ import logging
 from typing import List, Optional, Tuple
 import os
 from functools import wraps
+from scipy.signal import hilbert, welch
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -97,17 +98,15 @@ class PPGPreprocessor:
         lowcut=0.4,  # Relaxed from 0.5 to 0.4 Hz for better 50-100 Hz compatibility
         highcut=8.0,
         filter_order=4,
-        peak_height_threshold=20,
-        peak_distance_factor=0.8,
         similarity_threshold=0.70,
         # Respiratory-focused extras
-        resp_lowcut=0.1,
-        resp_highcut=0.4,
-        rb: float = 1,
+        resp_lowcut=0.15,
+        resp_highcut=0.5,
+        rb: float = 1.0,
         l_lt: float = 0.0,
-        hampel_window_size: int = 15,
+        hampel_window_size: int = 220,
         hampel_threshold: float = 3.0,
-        ibi_resample_hz: float = 4.0
+        ibi_resample_hz: float = 20.0  # Increased from 10.0 for better frequency resolution
     ):
         self.sampling_rate = sampling_rate
         self.segment_length = segment_length
@@ -115,8 +114,6 @@ class PPGPreprocessor:
         self.lowcut = lowcut
         self.highcut = highcut
         self.filter_order = filter_order
-        self.peak_height_threshold = peak_height_threshold
-        self.peak_distance = int(peak_distance_factor * sampling_rate)
         self.similarity_threshold = similarity_threshold
         # Respiratory extras
         self.resp_lowcut = resp_lowcut
@@ -191,20 +188,12 @@ class PPGPreprocessor:
             return None
         return filtered_signal
 
-    def detect_peaks(self, ppg_signal):
-        peaks, _ = signal.find_peaks(
-            ppg_signal,
-            height=self.peak_height_threshold,
-            distance=self.peak_distance
-        )
-        return peaks
-
     def detect_peaks_dynamic(self, ppg_signal):
         """
         Heart-beat oriented peak detector with dynamic thresholds.
         Uses prominence to be robust across amplitudes.
         """
-        distance = int(0.3 * self.sampling_rate)  # ~200 bpm max
+        distance = int(0.4 * self.sampling_rate)  # ~200 bpm max
         prominence = max(0.05 * np.nanstd(ppg_signal), 1e-6)  # Reduced from 0.1 for better sensitivity
         try:
             peaks, _ = signal.find_peaks(ppg_signal, distance=distance, prominence=prominence)
@@ -299,40 +288,41 @@ class PPGPreprocessor:
         x_max = np.nanmax(x)
         rng = max(x_max - x_min, 1e-12)
         norm = (x - x_min) / rng
-        return self.rb * norm + self.l_lt
+        enchancement = self.rb * norm + self.l_lt
+        return pow(enchancement,2)
 
     def hampel_filter(self, x: np.ndarray) -> np.ndarray:
-        """Sample-based Hampel filter; replaces outliers with local median.
-        Window size is in samples and will be forced odd.
+        """Vectorized Hampel filter; replaces outliers with local median.
+        Uses scipy.ndimage.median_filter for efficient computation.
         """
+        from scipy.ndimage import median_filter
+        
         x = np.asarray(x, dtype=np.float64)
         n = x.size
-        k = self.hampel_window_size // 2
-        y = x.copy()
         if n == 0:
-            return y
-        # Precompute rolling medians using simple sliding window (O(n*k)) for robustness
-        for i in range(k, n - k):
-            w = x[i - k:i + k + 1]
-            med = np.median(w)
-            mad = np.median(np.abs(w - med))
-            sigma = 1.4826 * mad + 1e-12
-            if np.abs(x[i] - med) > self.hampel_threshold * sigma:
-                y[i] = med
+            return x
+        
+        k = self.hampel_window_size
+        # Compute rolling median using fast convolution-based filter
+        med = median_filter(x, size=k, mode='reflect')
+        # Compute median absolute deviation
+        mad = median_filter(np.abs(x - med), size=k, mode='reflect')
+        sigma = 1.4826 * mad + 1e-12
+        
+        # Replace outliers with median values
+        mask = np.abs(x - med) > self.hampel_threshold * sigma
+        y = x.copy()
+        y[mask] = med[mask]
         return y
 
     def compute_esqi(self, x: np.ndarray) -> Tuple[float, float]:
-        """Entropy-based signal quality index.
-        Returns (entropy, esqi) where esqi = 1 - normalized_entropy in [0,1].
-        """
+        """Entropy-based signal quality index matching the paper formula."""
         x = np.asarray(x, dtype=np.float64)
-        power = x ** 2
-        total = np.sum(power) + 1e-12
-        p = power / total
-        entropy = -np.sum(p * np.log(p + 1e-12))
-        max_entropy = np.log(len(x) + 1e-12)
-        entropy_norm = min(entropy / (max_entropy + 1e-12), 1.0)
-        esqi = 1.0 - entropy_norm
+        x_squared = x ** 2
+    
+        # Compute entropy directly on squared values (no normalization)
+        entropy = -np.sum(x_squared * np.log(x_squared + 1e-12))
+        esqi = 1.0 - entropy
         return float(entropy), float(esqi)
 
     def compute_ibis(self, peaks: np.ndarray, fs: float) -> Tuple[np.ndarray, np.ndarray]:
@@ -343,6 +333,8 @@ class PPGPreprocessor:
         ibis = np.diff(times)  # seconds between beats
         # assign IBI time at mid-point between two peaks
         ibi_times = times[:-1] + ibis / 2.0
+        logger.info("n_IBI: %d", len(ibis))
+        logger.info("IBI mean (ms): %.1f std (ms): %.1f", np.mean(ibis)*1000, np.std(ibis)*1000)
         return ibi_times, ibis
 
     def resample_series(self, t: np.ndarray, y: np.ndarray, target_fs: float) -> Tuple[np.ndarray, np.ndarray, float]:
@@ -358,10 +350,10 @@ class PPGPreprocessor:
         return t_even, y_even, target_fs
 
     def welch_psd(self, x: np.ndarray, fs: float) -> Tuple[np.ndarray, np.ndarray]:
-        """Welch PSD per supplied paper parameters.
+        """Welch PSD with optimized segmentation for variance reduction.
         - Window: Hann
         - Overlap: 50%
-        - nfft: length of data
+        - Segment length: 30 seconds (or full length if shorter)
         - Scaling: density
         - Averaging: mean
         """
@@ -369,7 +361,7 @@ class PPGPreprocessor:
         if len(x) < 8:
             return np.array([]), np.array([])
         n = len(x)
-        nperseg = n  # length of data
+        nperseg = min(n, int(30 * fs))  # 30-second segments for better frequency resolution
         noverlap = nperseg // 2
         freqs, psd = signal.welch(
             x,
@@ -393,47 +385,6 @@ class PPGPreprocessor:
         f_band = freqs[mask]
         f_max = float(f_band[idx])
         return f_max * 60.0, f_max
-
-    # ---------- New: ESQI segmentation and robust peak selection ----------
-    def segment_by_esqi(
-        self,
-        x: np.ndarray,
-        fs: float,
-        window_sec: float = 10.0,
-        step_sec: float = 5.0,
-        esqi_thresh: float = 0.6,
-    ) -> Tuple[np.ndarray, List[Tuple[int, int]], float, float]:
-        """Segment signal, compute ESQI per window, and return concatenated
-        high-quality samples along with window indices, global entropy and ESQI.
-
-        Returns:
-            x_hq: concatenated high-quality samples (empty if none)
-            windows_kept: list of (start_idx, end_idx) kept windows (half-open)
-            entropy_all: entropy on full input x
-            esqi_all: ESQI on full input x
-        """
-        x = np.asarray(x, dtype=np.float64)
-        n = x.size
-        if n == 0:
-            return np.array([]), [], 0.0, 0.0
-        w = max(int(round(window_sec * fs)), 1)
-        s = max(int(round(step_sec * fs)), 1)
-        kept: List[Tuple[int, int]] = []
-        parts: List[np.ndarray] = []
-        # global metrics
-        ent_all, esqi_all = self.compute_esqi(x)
-
-        for start in range(0, n - w + 1, s):
-            end = start + w
-            seg = x[start:end]
-            ent, esqi = self.compute_esqi(seg)
-            if esqi >= esqi_thresh:
-                kept.append((start, end))
-                parts.append(seg)
-        if parts:
-            return np.concatenate(parts, axis=0), kept, float(ent_all), float(esqi_all)
-        else:
-            return np.array([]), [], float(ent_all), float(esqi_all)
 
     def select_resp_peak(
         self,
@@ -589,8 +540,7 @@ async def preprocess_respiratory(request: RespiratoryPreprocessRequest):
     2) Respiratory bandpass filter (0.1-0.5 Hz)
     3) Peak enhancement
     4) Hampel filter for outlier removal
-    5) Signal quality segmentation (eSQI)
-    6) IBI extraction from high-quality windows
+    6) IBI extraction via heart-rate band peak detection
     7) PSD analysis (IBI-based if available, else signal-based)
     8) Respiratory rate estimation from dominant frequency
     
@@ -623,29 +573,13 @@ async def preprocess_respiratory(request: RespiratoryPreprocessRequest):
     # 4) Remove outliers with Hampel filter
     denoised = pre.hampel_filter(enhanced)
     
-    # 5) Segment signal by eSQI to identify high-quality windows
-    x_hq, windows_kept, entropy, esqi = pre.segment_by_esqi(
-        denoised,
-        fs=pre.sampling_rate,
-        window_sec=10.0,
-        step_sec=5.0,
-        esqi_thresh=0.5,
-    )
+    # 5) Compute global ESQI for quality metrics (no segmentation/filtering)
+    entropy, esqi = pre.compute_esqi(denoised)
     
     # 6) Detect peaks in heart-rate band to extract IBIs (reuse same preprocessor instance)
     heart_band = pre.bandpass_filter(cleaned, mode='heart')
     peaks = pre.detect_peaks_dynamic(heart_band) if heart_band is not None else np.array([])
     ibi_t, ibi = pre.compute_ibis(peaks, pre.sampling_rate)
-    
-    # Restrict IBIs to high-quality windows identified by eSQI
-    if len(ibi) and windows_kept:
-        keep_mask = np.zeros_like(ibi_t, dtype=bool)
-        for (s_idx, e_idx) in windows_kept:
-            t0 = s_idx / pre.sampling_rate
-            t1 = e_idx / pre.sampling_rate
-            keep_mask |= (ibi_t >= t0) & (ibi_t <= t1)
-        ibi_t = ibi_t[keep_mask]
-        ibi = ibi[keep_mask]
 
     # 7a) IBI-based PSD analysis (preferred method if sufficient IBIs available)
     method_used = "ibi-welch"
@@ -669,11 +603,11 @@ async def preprocess_respiratory(request: RespiratoryPreprocessRequest):
             rr_bpm, rr_hz, prom, dom = pre.select_resp_peak(
                 freqs,
                 psd,
-                band=(pre.resp_lowcut, pre.resp_highcut),
-                min_bpm=6,
-                max_bpm=30.0,
+                band=(0.15, 0.5),
+                min_bpm=9.0,
+                max_bpm=60.0,
                 min_prom_rel=0.12,
-                dominance_ratio=1.2,
+                dominance_ratio=0.9,
             )
             resp_rate_bpm, resp_freq_hz = rr_bpm, rr_hz
             peak_prom, dom_ratio = prom, dom
@@ -682,24 +616,24 @@ async def preprocess_respiratory(request: RespiratoryPreprocessRequest):
     if resp_rate_bpm is None:
         method_used = "resp-signal-welch"
         used_fallback = True
-        base = x_hq if x_hq.size else denoised
+        base = denoised  # Use full denoised signal
         freqs, psd = pre.welch_psd(base - np.mean(base), pre.sampling_rate)
         if freqs.size and psd.size:
             rr_bpm, rr_hz, prom, dom = pre.select_resp_peak(
                 freqs,
                 psd,
-                band=(pre.resp_lowcut, pre.resp_highcut),
-                min_bpm=10.0,
-                max_bpm=30.0,
+                band=(0.15, 0.75),
+                min_bpm=9.0,
+                max_bpm=60.0,
                 min_prom_rel=0.12,
-                dominance_ratio=1.2,
+                dominance_ratio=0.9,
             )
             resp_rate_bpm, resp_freq_hz = rr_bpm, rr_hz
             peak_prom, dom_ratio = prom, dom
 
     # 7c) Last-chance fallback: naive argmax on PSD if previous methods failed
     if resp_rate_bpm is None and freqs.size and psd.size:
-        naive_bpm, naive_hz = pre.resp_rate_from_psd(freqs, psd, band=(pre.resp_lowcut, pre.resp_highcut))
+        naive_bpm, naive_hz = pre.resp_rate_from_psd(freqs, psd, band=(0.15, 0.75))
         resp_rate_bpm = resp_rate_bpm or naive_bpm
         resp_freq_hz = resp_freq_hz or naive_hz
 
@@ -722,6 +656,36 @@ async def preprocess_respiratory(request: RespiratoryPreprocessRequest):
         freqs_out = freqs.tolist()
         psd_out = psd.tolist()
 
+    # Additionally, compute envelope-based PSD for diagnostics/validation
+    analytic = hilbert(cleaned)  # ← Use raw PPG, not resp_filt
+    env = np.abs(analytic)
+    # Apply respiratory bandpass to envelope to isolate breathing modulation
+    env_filt = pre.bandpass_filter(env, lowcut=0.15, highcut=0.5, mode='resp')
+    if env_filt is None:
+        env_filt = env  # Fallback if filter fails
+    f_env, P_env = welch(env_filt - np.mean(env_filt), fs=pre.sampling_rate, nperseg=min(512, len(env_filt)))
+    mask_env = (f_env >= 0.15) & (f_env <= 0.75)
+    env_peak_hz = None
+    env_peak_bpm = None
+    if np.any(mask_env):
+        idx_env = np.argmax(P_env[mask_env])
+        env_peak_hz = f_env[mask_env][idx_env]
+        env_peak_bpm = env_peak_hz * 60.0
+        logger.info("Envelope-PSD peak: %.3f Hz (%.1f bpm), mag=%.3e", env_peak_hz, env_peak_bpm, P_env[mask_env][idx_env])
+
+    # Log top IBI-PSD peaks for comparison
+    if freqs.size and psd.size:
+        idx_sorted = np.argsort(psd)[-6:][::-1]
+        logger.info("Top IBI-PSD peaks:")
+        for i in idx_sorted:
+            logger.info("  %.4f Hz (%.1f bpm), mag=%.3e", freqs[i], freqs[i]*60, psd[i])
+    
+    # Log which method was used and both estimates
+    if resp_rate_bpm is not None:
+        logger.info("Final RR estimate: %.1f bpm (%.3f Hz) via %s", resp_rate_bpm, resp_freq_hz or 0, method_used)
+        if env_peak_bpm is not None:
+            diff = abs(resp_rate_bpm - env_peak_bpm)
+            logger.info("Envelope vs Selected difference: %.1f bpm", diff)
     return RespiratoryPreprocessResponse(
         success=True,
         resp_rate_bpm=float(resp_rate_bpm),
