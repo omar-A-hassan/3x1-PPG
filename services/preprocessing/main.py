@@ -68,15 +68,12 @@ class RespiratoryPreprocessResponse(BaseModel):
     success: bool
     resp_rate_bpm: Optional[float] = None
     resp_freq_hz: Optional[float] = None
+    confirmation_bpm: Optional[float] = None
+    confirmation_hz: Optional[float] = None
     esqi: Optional[float] = None
     entropy: Optional[float] = None
     peaks_count: int = 0
-    method_used: Optional[str] = None
-    # Diagnostics
-    alt_peak_bpm: Optional[float] = None
-    peak_prominence: Optional[float] = None
-    dominance_ratio: Optional[float] = None
-    used_fallback: Optional[bool] = None
+    method_used: str = "ibi-welch-custom"
     # Limited-length arrays to avoid huge responses
     freqs: Optional[List[float]] = None
     psd: Optional[List[float]] = None
@@ -104,7 +101,7 @@ class PPGPreprocessor:
         resp_highcut=0.5,
         rb: float = 1.0,
         l_lt: float = 0.0,
-        hampel_window_size: int = 220,
+        hampel_window_size: int = 199,
         hampel_threshold: float = 3.0,
         ibi_resample_hz: float = 20.0  # Increased from 10.0 for better frequency resolution
     ):
@@ -318,12 +315,24 @@ class PPGPreprocessor:
     def compute_esqi(self, x: np.ndarray) -> Tuple[float, float]:
         """Entropy-based signal quality index matching the paper formula."""
         x = np.asarray(x, dtype=np.float64)
-        x_squared = x ** 2
-    
+
+        #Normalize the signal 
+        #----------------------------------------
+        energy = np.sum(x ** 2)
+        if energy < 1e-12:
+            return 0.0, 0.0
+        x_normalized = x / np.sqrt(energy)
+        #----------------------------------------
         # Compute entropy directly on squared values (no normalization)
-        entropy = -np.sum(x_squared * np.log(x_squared + 1e-12))
-        esqi = 1.0 - entropy
-        return float(entropy), float(esqi)
+        x_squared = x_normalized ** 2
+        x_squared_clean = x_squared[x_squared > 1e-12]
+
+        entropy = -np.sum(x_squared_clean * np.log(x_squared_clean + 1e-12))
+        # Normalize entropy to [0, 1] range
+        max_entropy = np.log(len(x))  # Maximum possible entropy
+        normalized_entropy = entropy / max_entropy
+        esqi = 1.0 - normalized_entropy
+        return float(normalized_entropy), float(esqi)
 
     def compute_ibis(self, peaks: np.ndarray, fs: float) -> Tuple[np.ndarray, np.ndarray]:
         """Compute inter-beat intervals (seconds) and their sample times (seconds)."""
@@ -361,7 +370,7 @@ class PPGPreprocessor:
         if len(x) < 8:
             return np.array([]), np.array([])
         n = len(x)
-        nperseg = min(n, int(30 * fs))  # 30-second segments for better frequency resolution
+        nperseg = min(n, int(25 * fs))  # 25-second segments for better frequency resolution
         noverlap = nperseg // 2
         freqs, psd = signal.welch(
             x,
@@ -535,16 +544,18 @@ async def preprocess_signal(request: PreprocessRequest):
 @handle_preprocessing_errors("Respiratory preprocessing")
 async def preprocess_respiratory(request: RespiratoryPreprocessRequest):
     """
-    Respiratory rate estimation pipeline:
+    Custom respiratory rate estimation pipeline (IBI-Welch method):
     1) Missing values handling
-    2) Respiratory bandpass filter (0.1-0.5 Hz)
+    2) Bandpass filter (0.15-4.0 Hz)
     3) Peak enhancement
     4) Hampel filter for outlier removal
-    6) IBI extraction via heart-rate band peak detection
-    7) PSD analysis (IBI-based if available, else signal-based)
-    8) Respiratory rate estimation from dominant frequency
+    5) Peak detection in filtered signal
+    6) IBI computation with ±30% filtering
+    7) Resample IBIs to uniform 20 Hz grid
+    8) Welch PSD on centered IBI data
+    9) Respiratory rate from PSD peak detection
     
-    Returns: respiratory_rate (bpm), peaks_count, dominant_freq, and optional IBI/PSD arrays
+    Returns: respiratory_rate (bpm), confirmation values, and PSD arrays
     """
     raw = np.array(request.signal, dtype=np.float64)
     logger.info(f"[Resp] received {raw.size} samples")
@@ -562,90 +573,121 @@ async def preprocess_respiratory(request: RespiratoryPreprocessRequest):
     if cleaned is None:
         return RespiratoryPreprocessResponse(success=False, peaks_count=0, error="Signal invalid after missing-value handling")
     
-    # 2) Apply respiratory bandpass filter (0.1-0.5 Hz → ~6-30 breaths/min)
-    resp_filt = pre.bandpass_filter(cleaned, mode='resp')
-    if resp_filt is None:
-        return RespiratoryPreprocessResponse(success=False, peaks_count=0, error="Respiratory bandpass failed")
+    # 2) Apply bandpass filter (0.15-4.0 Hz - custom band)
+    bandpassed = pre.bandpass_filter(cleaned, lowcut=0.15, highcut=4.0)
+    if bandpassed is None:
+        return RespiratoryPreprocessResponse(success=False, peaks_count=0, error="Bandpass filter failed")
     
     # 3) Enhance peaks for better detection
-    enhanced = pre.peak_enhancement(resp_filt)
+    enhanced = pre.peak_enhancement(bandpassed)
     
     # 4) Remove outliers with Hampel filter
     denoised = pre.hampel_filter(enhanced)
     
-    # 5) Compute global ESQI for quality metrics (no segmentation/filtering)
+    # 5) Compute global ESQI for quality metrics
     entropy, esqi = pre.compute_esqi(denoised)
     
-    # 6) Detect peaks in heart-rate band to extract IBIs (reuse same preprocessor instance)
-    heart_band = pre.bandpass_filter(cleaned, mode='heart')
-    peaks = pre.detect_peaks_dynamic(heart_band) if heart_band is not None else np.array([])
-    ibi_t, ibi = pre.compute_ibis(peaks, pre.sampling_rate)
-
-    # 7a) IBI-based PSD analysis (preferred method if sufficient IBIs available)
-    method_used = "ibi-welch"
-    freqs = np.array([])
-    psd = np.array([])
-    resp_rate_bpm: Optional[float] = None
-    resp_freq_hz: Optional[float] = None
-    peak_prom: Optional[float] = None
-    dom_ratio: Optional[float] = None
-    used_fallback = False
-
-    if len(ibi) >= 8:
-        # Resample IBI time series to uniform sampling rate
-        t_even, ibi_even, fs_even = pre.resample_series(ibi_t, ibi, pre.ibi_resample_hz)
-        
-        # Compute power spectral density via Welch's method
-        freqs, psd = pre.welch_psd(ibi_even - np.mean(ibi_even), fs_even)
-        
-        if freqs.size and psd.size:
-            # Select respiratory peak in PSD within expected frequency band
-            rr_bpm, rr_hz, prom, dom = pre.select_resp_peak(
-                freqs,
-                psd,
-                band=(0.15, 0.5),
-                min_bpm=9.0,
-                max_bpm=60.0,
-                min_prom_rel=0.12,
-                dominance_ratio=0.9,
-            )
-            resp_rate_bpm, resp_freq_hz = rr_bpm, rr_hz
-            peak_prom, dom_ratio = prom, dom
-
-    # 7b) Fallback: signal-based PSD if IBI-based method failed
-    if resp_rate_bpm is None:
-        method_used = "resp-signal-welch"
-        used_fallback = True
-        base = denoised  # Use full denoised signal
-        freqs, psd = pre.welch_psd(base - np.mean(base), pre.sampling_rate)
-        if freqs.size and psd.size:
-            rr_bpm, rr_hz, prom, dom = pre.select_resp_peak(
-                freqs,
-                psd,
-                band=(0.15, 0.75),
-                min_bpm=9.0,
-                max_bpm=60.0,
-                min_prom_rel=0.12,
-                dominance_ratio=0.9,
-            )
-            resp_rate_bpm, resp_freq_hz = rr_bpm, rr_hz
-            peak_prom, dom_ratio = prom, dom
-
-    # 7c) Last-chance fallback: naive argmax on PSD if previous methods failed
-    if resp_rate_bpm is None and freqs.size and psd.size:
-        naive_bpm, naive_hz = pre.resp_rate_from_psd(freqs, psd, band=(0.15, 0.75))
-        resp_rate_bpm = resp_rate_bpm or naive_bpm
-        resp_freq_hz = resp_freq_hz or naive_hz
-
-    if resp_rate_bpm is None:
+    # 6) Detect peaks in denoised signal
+    peaks = pre.detect_peaks_dynamic(denoised)
+    if len(peaks) < 2:
         return RespiratoryPreprocessResponse(
             success=False,
             peaks_count=int(len(peaks)),
             esqi=float(esqi),
             entropy=float(entropy),
-            error="Unable to estimate respiratory rate"
+            error="Insufficient peaks detected"
         )
-
+    
+    # 7) Compute IBIs from detected peaks
+    time = np.arange(len(raw)) / float(pre.sampling_rate)
+    peaks_times = time[peaks]
+    ibis = np.diff(peaks_times)
+    
+    # 8) Filter IBIs (±30% of mean)
+    mean_ibi = np.mean(ibis)
+    mask = (ibis > (mean_ibi - mean_ibi * 0.3)) & (ibis < (mean_ibi + mean_ibi * 0.3))
+    ibis_filt = ibis[mask]
+    ibi_times = peaks_times[:-1][mask] + ibis_filt / 2.0
+    
+    if len(ibis_filt) < 8:
+        return RespiratoryPreprocessResponse(
+            success=False,
+            peaks_count=int(len(peaks)),
+            esqi=float(esqi),
+            entropy=float(entropy),
+            error="Insufficient valid IBIs after filtering"
+        )
+    
+    # 9) Resample IBI time series to uniform sampling rate (20 Hz)
+    t_even, ibi_even, fs_even = pre.resample_series(ibi_times, ibis_filt, target_fs=20)
+    
+    # 10) Compute power spectral density via Welch's method (centered data)
+    freqs, psd = pre.welch_psd(ibi_even - np.mean(ibi_even), fs_even)
+    
+    if freqs.size == 0 or psd.size == 0:
+        return RespiratoryPreprocessResponse(
+            success=False,
+            peaks_count=int(len(peaks)),
+            esqi=float(esqi),
+            entropy=float(entropy),
+            error="PSD computation failed"
+        )
+    
+    # 11) Detect respiratory peaks in PSD (0.15-0.6 Hz band)
+    mask_resp = (freqs >= 0.15) & (freqs <= 0.6)
+    if not np.any(mask_resp):
+        return RespiratoryPreprocessResponse(
+            success=False,
+            peaks_count=int(len(peaks)),
+            esqi=float(esqi),
+            entropy=float(entropy),
+            error="No frequencies in respiratory band"
+        )
+    
+    # Use find_peaks with PSD-appropriate parameters
+    psd_masked = psd[mask_resp]
+    psd_range = np.max(psd_masked) - np.min(psd_masked)
+    min_prominence = 0.05 * psd_range  # 5% of PSD range in respiratory band
+    
+    psd_peaks, properties = signal.find_peaks(
+        psd_masked,
+        prominence=min_prominence,  # Peak must stand out by 5% of range
+        height=np.max(psd_masked) * 0.02,  # At least 2% of max height
+        distance=5  # Minimum 5 frequency bins spacing
+    )
+    
+    if len(psd_peaks) == 0:
+        # Fallback to argmax if no peaks detected
+        max_idx = np.argmax(psd_masked)
+        resp_freq_hz = freqs[mask_resp][max_idx]
+    else:
+        # Select peak with highest power
+        psd_peak_values = psd_masked[psd_peaks]
+        best_idx = np.argmax(psd_peak_values)
+        resp_freq_hz = freqs[mask_resp][psd_peaks[best_idx]]
+    
+    resp_rate_bpm = float(resp_freq_hz * 60.0)
+    resp_freq_hz = float(resp_freq_hz)
+    
+    # 12) Compute confirmation value using original robust method
+    confirmation_bpm = None
+    confirmation_hz = None
+    try:
+        conf_bpm, conf_hz, _, _ = pre.select_resp_peak(
+            freqs,
+            psd,
+            band=(0.15, 0.5),
+            min_bpm=9.0,
+            max_bpm=60.0,
+            min_prom_rel=0.12,
+            dominance_ratio=0.9,
+        )
+        if conf_bpm is not None:
+            confirmation_bpm = float(conf_bpm)
+            confirmation_hz = float(conf_hz)
+    except Exception:
+        pass  # Confirmation is optional
+    
     # Trim PSD vectors to prevent excessive payload size (limit to 2048 points)
     MAX_PSD_POINTS = 2048
     if freqs.size > MAX_PSD_POINTS:
@@ -655,48 +697,21 @@ async def preprocess_respiratory(request: RespiratoryPreprocessRequest):
     else:
         freqs_out = freqs.tolist()
         psd_out = psd.tolist()
-
-    # Additionally, compute envelope-based PSD for diagnostics/validation
-    analytic = hilbert(cleaned)  # ← Use raw PPG, not resp_filt
-    env = np.abs(analytic)
-    # Apply respiratory bandpass to envelope to isolate breathing modulation
-    env_filt = pre.bandpass_filter(env, lowcut=0.15, highcut=0.5, mode='resp')
-    if env_filt is None:
-        env_filt = env  # Fallback if filter fails
-    f_env, P_env = welch(env_filt - np.mean(env_filt), fs=pre.sampling_rate, nperseg=min(512, len(env_filt)))
-    mask_env = (f_env >= 0.15) & (f_env <= 0.75)
-    env_peak_hz = None
-    env_peak_bpm = None
-    if np.any(mask_env):
-        idx_env = np.argmax(P_env[mask_env])
-        env_peak_hz = f_env[mask_env][idx_env]
-        env_peak_bpm = env_peak_hz * 60.0
-        logger.info("Envelope-PSD peak: %.3f Hz (%.1f bpm), mag=%.3e", env_peak_hz, env_peak_bpm, P_env[mask_env][idx_env])
-
-    # Log top IBI-PSD peaks for comparison
-    if freqs.size and psd.size:
-        idx_sorted = np.argsort(psd)[-6:][::-1]
-        logger.info("Top IBI-PSD peaks:")
-        for i in idx_sorted:
-            logger.info("  %.4f Hz (%.1f bpm), mag=%.3e", freqs[i], freqs[i]*60, psd[i])
     
-    # Log which method was used and both estimates
-    if resp_rate_bpm is not None:
-        logger.info("Final RR estimate: %.1f bpm (%.3f Hz) via %s", resp_rate_bpm, resp_freq_hz or 0, method_used)
-        if env_peak_bpm is not None:
-            diff = abs(resp_rate_bpm - env_peak_bpm)
-            logger.info("Envelope vs Selected difference: %.1f bpm", diff)
+    logger.info("Primary RR estimate: %.1f bpm (%.3f Hz) via ibi-welch-custom", resp_rate_bpm, resp_freq_hz)
+    if confirmation_bpm is not None:
+        logger.info("Confirmation RR: %.1f bpm (difference: %.1f bpm)", confirmation_bpm, abs(resp_rate_bpm - confirmation_bpm))
+    
     return RespiratoryPreprocessResponse(
         success=True,
-        resp_rate_bpm=float(resp_rate_bpm),
-        resp_freq_hz=float(resp_freq_hz) if resp_freq_hz is not None else None,
+        resp_rate_bpm=resp_rate_bpm,
+        resp_freq_hz=resp_freq_hz,
+        confirmation_bpm=confirmation_bpm,
+        confirmation_hz=confirmation_hz,
         esqi=float(esqi),
         entropy=float(entropy),
         peaks_count=int(len(peaks)),
-        method_used=method_used,
-        peak_prominence=peak_prom,
-        dominance_ratio=dom_ratio,
-        used_fallback=used_fallback,
+        method_used="ibi-welch-custom",
         freqs=freqs_out,
         psd=psd_out,
     )
