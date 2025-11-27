@@ -27,10 +27,10 @@ app = FastAPI(title="Model Service")
 # UI callback endpoint (env override for local runs)
 UI_SERVICE_URL = os.getenv("UI_SERVICE_URL", "http://localhost:8003")
 
-# Add project root to path
-PROJECT_ROOT = Path(__file__).parent.parent.parent
-sys.path.insert(0, str(PROJECT_ROOT))
-sys.path.insert(0, str(PROJECT_ROOT / 'ts2vec'))
+# In Docker, src and ts2vec are already in /app (copied by Dockerfile)
+# Add them to path for imports
+sys.path.insert(0, '/app')
+sys.path.insert(0, '/app/ts2vec')
 
 class PredictRequest(BaseModel):
     segments: List[List[float]]
@@ -181,7 +181,7 @@ model_inference = None
 async def startup_event():
     """Initialize model on startup"""
     global model_inference
-    model_path = Path(r"C:\Users\nazeh\BioInfo Trials\3x1-PPG\Dev\3x1-PPG\services\model\best_model.pt")
+    model_path = Path("best_model.pt")  # Relative to /app in container
 
     if not model_path.exists():
         logger.error(f"Model file not found: {model_path}")

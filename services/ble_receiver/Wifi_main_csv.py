@@ -3,6 +3,7 @@ WebSocket Receiver Service with Data Saving
 Saves collected PPG data before sending to preprocessing
 """
 
+import re
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import httpx
@@ -37,6 +38,7 @@ ESP32_DEVICE_NAME = "ESP32-PPG-Glucose"
 PREPROCESSING_SERVICE_URL = os.getenv("PREPROCESSING_SERVICE_URL", "http://localhost:8001")
 UI_SERVICE_URL = os.getenv("UI_SERVICE_URL", "http://localhost:8003")
 TOTAL_SAMPLES = 3000  # 100 seconds × 50 Hz (optimal for smooth PPG + accurate respiratory)
+ESP32_WS_URL = os.getenv("ESP32_WS_URL", "ws://192.168.4.1:81/")  # Configurable ESP32 WebSocket URL
 
 # Data storage configuration
 DATA_STORAGE_DIR = Path("ppg_data")  # Directory to store collected data
@@ -170,14 +172,6 @@ async def get_status():
         last_saved_file=collection_metadata.get("last_saved_file")
     )
 
-@app.post("/scan")
-async def scan_devices():
-    example_ws = "ws://192.168.4.1:81/"
-    return {
-        "note": "In AP/WebSocket mode, scan is not available.",
-        "example_ws_url": example_ws,
-        "ssid_hint": "ESP32-PPG-Glucose (AP mode)"
-    }
 def _on_ws_open(ws):
     global collection_status
     logger.info("WebSocket connection opened")
@@ -289,8 +283,23 @@ def _on_ws_message(ws, message):
     except Exception as e:
         logger.exception(f"Error processing text message: {e}")
 
+@app.post("/connect")
+async def connect_device():
+    "Reconnect to ESP32 WebSocket using default URL"
+    global connected_ws_app, collection_status, ws_url_in_use, ESP32_WS_URL
+    with state_lock:
+        if connected_ws_app is not None:
+            return {"status": collection_status}
+        
+    _start_ws_thread(ESP32_WS_URL)
+    await asyncio.sleep(1.0)  # Give time for connection to establish
+    with state_lock:
+        current_status = collection_status  # Read under lock
+    return {"status": current_status}
+    
+
 def _start_ws_thread(ws_url):
-    global connected_ws_app, ws_thread, ws_url_in_use
+    global connected_ws_app, ws_thread, ws_url_in_use, ESP32_WS_URL
 
     if connected_ws_app is not None:
         logger.info("WebSocket client already running")
@@ -320,24 +329,6 @@ def _start_ws_thread(ws_url):
     ws_thread.start()
     ws_url_in_use = ws_url
 
-@app.post("/connect")
-async def connect_device(device_address: str):
-    global connected_ws_app, ws_thread, ws_url_in_use, collection_status
-
-    if not device_address:
-        raise HTTPException(status_code=400, detail="device_address required")
-
-    if connected_ws_app is not None:
-        return {"status": "already_connected", "ws_url": ws_url_in_use}
-
-    try:
-        _start_ws_thread(device_address)
-        await asyncio.sleep(0.5)
-        return {"status": "connecting", "ws_url": device_address}
-    except Exception as e:
-        logger.exception(f"Failed to start WebSocket: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
 @app.post("/collect")
 async def start_collection():
     global ppg_buffer, collection_status, connected_ws_app, collection_metadata
@@ -350,6 +341,7 @@ async def start_collection():
         with state_lock:
             ppg_buffer = []
             collection_status = "COLLECTING"
+            current_status = collection_status  # Copy to local variable
             # Record start time
             collection_metadata["start_time"] = datetime.now()
             collection_metadata["end_time"] = None
@@ -367,8 +359,10 @@ async def start_collection():
             except Exception as e:
                 logger.exception(f"Failed to send start command: {e}")
                 raise
-
-        return {"status": "collecting"}
+            with state_lock:
+                current_status = collection_status  # Read under lock
+        
+        return {"status": current_status}
     except Exception as e:
         logger.exception(f"Failed to start collection: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -729,7 +723,8 @@ async def stop_collection():
             logger.info("Sent STOP command to ESP32")
         with state_lock:
             collection_status = "STOPPED"
-        return {"status": "stopped"}
+            current_status = collection_status  # Copy to local variable
+        return {"status": current_status}
     except Exception as e:
         logger.exception(f"Failed to stop: {e}")
         raise HTTPException(status_code=500, detail=str(e))

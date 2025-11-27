@@ -8,7 +8,11 @@ services:
     networks:
       - ppg_network
     environment:
+      - ESP32_WS_URL=ws://host.docker.internal:81/
       - PREPROCESSING_SERVICE_URL=http://preprocessing:8001
+      - UI_SERVICE_URL=http://ui:8003
+    volumes:
+      - ppg_data:/app/ppg_data
     restart: unless-stopped
 
   preprocessing:
@@ -39,8 +43,16 @@ services:
       - "8003:8003"
     networks:
       - ppg_network
+    environment:
+      - RECEIVER_SERVICE_URL=http://ble_receiver:8000
+      - PREPROCESSING_SERVICE_URL=http://preprocessing:8001
+    volumes:
+      - ppg_data:/app/ppg_data
     restart: unless-stopped
 
 networks:
   ppg_network:
     driver: bridge
+
+volumes:
+  ppg_data:

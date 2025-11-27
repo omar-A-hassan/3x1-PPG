@@ -454,7 +454,7 @@ async def compute_respiratory_rate(csv_path: Path):
         async with httpx.AsyncClient(timeout=60.0) as client:
             resp = await client.post(
                 f"{PREPROCESSING_SERVICE_URL}/preprocess_respiratory",
-                json={"signal": ir_values, "sampling_rate": 100}
+                json={"signal": ir_values, "sampling_rate": 50}
             )
             
             if resp.status_code == 200:
@@ -485,7 +485,9 @@ def create_gradio_interface():
         try:
             resp = httpx.post(f"{RECEIVER_SERVICE_URL}/{endpoint}", timeout=20.0)
             if resp.status_code == 200:
-                return f"✅ {endpoint.capitalize()} command sent successfully."
+                data = resp.json()
+                return (f"✅ {endpoint.capitalize()} command sent successfully.  \n"
+                f"🪧 Current Status: {data.get('status')}")
             else:
                 return f"⚠️ Failed: {resp.text}"
         except Exception as e:
@@ -786,8 +788,10 @@ def create_gradio_interface():
             with gr.Row():
                 start_btn = gr.Button("▶️ Start Collection", variant="primary", scale=1)
                 stop_btn = gr.Button("⏹ Stop Collection", variant="secondary", scale=1)
-                status_box = gr.Markdown(value="**Status:** Ready")
-                refresh_btn = gr.Button("🔄 Refresh")
+                status_box = gr.Markdown(value="**Status:** Please Refresh ⚠️")
+                with gr.Column(scale=1):
+                    refresh_btn = gr.Button("🔄 Refresh")
+                    reconnect_btn = gr.Button("🔌 Reconnect ESP32 / Refresh Status 🔄", variant="secondary", size="sm")
 
             gr.Markdown("---")
             gr.Markdown("## Current Prediction")
@@ -824,6 +828,10 @@ def create_gradio_interface():
             fn=get_current_result,
                 outputs=[glucose_output, details_output, ranges_output, history_text, history_plot, respiratory_output]
                 )
+            reconnect_btn.click(
+                fn=lambda: send_command_sync("connect"),
+                outputs=status_box,
+            )
         
         # ====================================================================
         # TAB 2: SIGNAL VISUALIZATION

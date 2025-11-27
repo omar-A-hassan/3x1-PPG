@@ -294,7 +294,7 @@ void setup() {
   if (err != ESP_OK) {
     Serial.printf("ERROR: Failed to create esp_timer: %d\n", err);
   } else {
-    Serial.println("esp_timer created successfully (50 Hz = 20ms period, will start on finger detect)");
+    Serial.println("esp_timer created successfully (100 Hz = 10 ms period, will start on finger detect)");
   }
 }
 
@@ -535,13 +535,6 @@ void printSensorDiagnostics() {
   Serial.printf("IR Value: %d, Red Value : %d\n", irValue,redValue);
   Serial.println(irValue);
 
-  if (irValue < MIN_IR_THRESHOLD) {
-    Serial.println("Status: NO FINGER DETECTED");
-  } else if (irValue > MAX_IR_THRESHOLD) {
-    Serial.println("Status: SIGNAL SATURATED (too much pressure)");
-  } else {
-    Serial.println("Status: GOOD SIGNAL");
-  }
   Serial.printf("Die Temperature: %.2f°C\n", particleSensor.readTemperature());
   Serial.println("===========================\n");
 }
