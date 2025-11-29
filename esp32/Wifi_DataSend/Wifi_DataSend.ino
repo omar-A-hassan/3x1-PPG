@@ -261,9 +261,9 @@ void setup() {
   // Configure MAX30102 for optimal signal quality at 100 Hz
   // Config C: sampleRate=400 Hz, sampleAverage=4 → 100 Hz output (better for glucose segmentation)
   byte ledBrightness = 0x1F;   // Options: 0=Off to 255=50mA
-  byte sampleAverage = 4;      // Hardware averaging: 4 samples @ 400 Hz → 100 Hz output (~6dB SNR)
+  byte sampleAverage = 8;      // Hardware averaging: 4 samples @ 400 Hz → 100 Hz output (~6dB SNR)
   byte ledMode = 2;            // Red + IR mode
-  int sampleRate = 200;        // Sensor ADC samples at 400 Hz, averages to 100 Hz
+  int sampleRate = 400;        // Sensor ADC samples at 400 Hz, averages to 100 Hz
   int pulseWidth = 411;        // 411 µs LED pulse (good SNR without saturation)
   int adcRange = 16384;        // 16-bit ADC range
 

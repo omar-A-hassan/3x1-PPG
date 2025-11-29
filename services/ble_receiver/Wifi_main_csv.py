@@ -3,6 +3,7 @@ WebSocket Receiver Service with Data Saving
 Saves collected PPG data before sending to preprocessing
 """
 
+from math import pi
 import re
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -13,6 +14,7 @@ import struct
 import logging
 import threading
 import time
+import websocket
 from websocket import WebSocketApp
 from datetime import datetime
 from pathlib import Path
@@ -23,6 +25,9 @@ import os
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Set WebSocket TCP connect timeout (affects initial connection attempts)
+websocket.setdefaulttimeout(3)
 
 app = FastAPI(title="WebSocket Receiver Service")
 
@@ -37,7 +42,7 @@ ENABLE_DOWNLOAD_ENDPOINTS = True  # Expose /download and /saved_data endpoints
 ESP32_DEVICE_NAME = "ESP32-PPG-Glucose"
 PREPROCESSING_SERVICE_URL = os.getenv("PREPROCESSING_SERVICE_URL", "http://localhost:8001")
 UI_SERVICE_URL = os.getenv("UI_SERVICE_URL", "http://localhost:8003")
-TOTAL_SAMPLES = 3000  # 100 seconds × 50 Hz (optimal for smooth PPG + accurate respiratory)
+TOTAL_SAMPLES = 3000  # 60 seconds × 50 Hz sampling
 ESP32_WS_URL = os.getenv("ESP32_WS_URL", "ws://192.168.4.1:81/")  # Configurable ESP32 WebSocket URL
 
 # Data storage configuration
@@ -145,7 +150,11 @@ async def _startup():
                     break
                 else:
                     logger.warning(f"[Auto-Connect] Attempt {attempt} - status is {collection_status}, retrying...")
-                    disconnect_device()  # Clean up failed connection
+                    # Wait for the previous thread to finish before cleanup
+                    if ws_thread and ws_thread.is_alive():
+                        logger.info(f"[Auto-Connect] Waiting for previous attempt to finish...")
+                        ws_thread.join(timeout=3)
+                    _disconnect_device_sync()  # Clean up failed connection
                     await asyncio.sleep(2)
             except Exception as e:
                 logger.warning(f"[Auto-Connect] Attempt {attempt} failed: {e}")
@@ -183,6 +192,7 @@ def _on_ws_close(ws, close_status_code, close_msg):
     logger.info(f"WebSocket closed: code={close_status_code}, msg={close_msg}")
     with state_lock:
         collection_status = "DISCONNECTED"
+    logger.info("Cleaned up WebSocket connection on close")
 
 def _on_ws_error(ws, error):
     global collection_status
@@ -287,12 +297,23 @@ def _on_ws_message(ws, message):
 async def connect_device():
     "Reconnect to ESP32 WebSocket using default URL"
     global connected_ws_app, collection_status, ws_url_in_use, ESP32_WS_URL
-    with state_lock:
-        if connected_ws_app is not None:
-            return {"status": collection_status}
-        
+
+    if collection_status != "DISCONNECTED" :
+        logger.info("WebSocket client already connected")
+        with state_lock:
+            current_status = collection_status  # Read under lock
+        return {"status": current_status}
+    
+    if connected_ws_app is not None:
+        logger.info("Cleaning up existing connection before reconnecting...")
+        _disconnect_device_sync()
+        await asyncio.sleep(0.5)  # Brief pause for cleanup
+    
+    logger.info(f"Connect request received for {ESP32_WS_URL}")
+    
     _start_ws_thread(ESP32_WS_URL)
-    await asyncio.sleep(1.0)  # Give time for connection to establish
+    logger.info(f"Connecting to ESP32 at {ESP32_WS_URL}...")
+    await asyncio.sleep(2.0)  # Give time for connection to establish
     with state_lock:
         current_status = collection_status  # Read under lock
     return {"status": current_status}
@@ -316,7 +337,7 @@ def _start_ws_thread(ws_url):
 
     def run_ws():
         try:
-            connected_ws_app.run_forever()
+            connected_ws_app.run_forever(reconnect=0,)
         except Exception as e:
             logger.exception(f"WebSocket run_forever terminated: {e}")
         finally:
@@ -709,6 +730,25 @@ async def save_and_process_data():
         return {"success": False, "error": str(e)}
 
 
+def _disconnect_device_sync():
+    """Synchronous disconnect helper - can be called from any thread"""
+    global connected_ws_app, ws_thread, ws_url_in_use, collection_status
+
+    if connected_ws_app:
+        try:
+            connected_ws_app.close()
+            time.sleep(0.2)
+        except Exception as e:
+            logger.exception(f"Error closing WebSocket: {e}")
+
+    connected_ws_app = None
+    ws_thread = None
+    ws_url_in_use = None
+    with state_lock:
+        collection_status = "DISCONNECTED"
+    logger.info("Disconnected from ESP32")
+
+
 @app.post("/stop")
 async def stop_collection():
     global connected_ws_app, collection_status
@@ -731,21 +771,8 @@ async def stop_collection():
 
 @app.post("/disconnect")
 async def disconnect_device():
-    global connected_ws_app, ws_thread, ws_url_in_use, collection_status
-
-    if connected_ws_app:
-        try:
-            connected_ws_app.close()
-            time.sleep(0.2)
-        except Exception as e:
-            logger.exception(f"Error closing WebSocket: {e}")
-
-    connected_ws_app = None
-    ws_thread = None
-    ws_url_in_use = None
-    with state_lock:
-        collection_status = "DISCONNECTED"
-    logger.info("Disconnected from ESP32")
+    """FastAPI endpoint - async wrapper for sync disconnect"""
+    _disconnect_device_sync()
     return {"status": "disconnected"}
 
 # ============================================================================
