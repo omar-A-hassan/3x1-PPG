@@ -8,17 +8,17 @@ RUN apt-get update && apt-get install -y \
     libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements
-COPY services/model/requirements.txt .
+# Copy requirements and install
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy service code
-COPY services/model/main.py .
+COPY main.py .
+COPY best_model.pt .
 
-# Copy project files (src, ts2vec, best_model.pt)
+# Copy src and ts2vec (must be copied into services/model/ folder first)
 COPY src /app/src
 COPY ts2vec /app/ts2vec
-COPY services/model/best_model.pt /app/best_model.pt
 
 EXPOSE 8002
 
@@ -27,4 +27,6 @@ ENV OMP_NUM_THREADS=1
 ENV MKL_NUM_THREADS=1
 ENV OPENBLAS_NUM_THREADS=1
 
-CMD ["python", "-u", "main.py"]
+# Use uvicorn for consistency
+# Cloud Run sets PORT env var, fallback to 8002 for local/docker-compose
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8002}"]

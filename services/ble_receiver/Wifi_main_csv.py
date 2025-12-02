@@ -1,11 +1,9 @@
 """
-WebSocket Receiver Service with Data Saving
-Saves collected PPG data before sending to preprocessing
+HTTP Receiver Service with Data Saving
+Receives PPG data chunks from ESP32 via HTTP POST and saves/processes them.
 """
 
-from math import pi
-import re
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 import httpx
 import asyncio
@@ -13,9 +11,6 @@ import numpy as np
 import struct
 import logging
 import threading
-import time
-import websocket
-from websocket import WebSocketApp
 from datetime import datetime
 from pathlib import Path
 import json
@@ -26,16 +21,15 @@ import os
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Set WebSocket TCP connect timeout (affects initial connection attempts)
-websocket.setdefaulttimeout(3)
-
-app = FastAPI(title="WebSocket Receiver Service")
+app = FastAPI(title="HTTP Receiver Service")
 
 # ============================================================================
 # DEBUG/DEPLOYMENT CONFIGURATION
 # ============================================================================
-ENABLE_CSV_SAVE = True          # Save all 5 formats to disk (archival)
-ENABLE_DOWNLOAD_ENDPOINTS = True  # Expose /download and /saved_data endpoints
+# For cloud deployment: disable CSV saving (no persistent storage)
+# For local debugging: set both to True
+ENABLE_CSV_SAVE = False          # Disable for cloud (no disk persistence)
+ENABLE_DOWNLOAD_ENDPOINTS = False  # Disable download endpoints for cloud
 # ============================================================================
 
 # Configuration
@@ -43,21 +37,21 @@ ESP32_DEVICE_NAME = "ESP32-PPG-Glucose"
 PREPROCESSING_SERVICE_URL = os.getenv("PREPROCESSING_SERVICE_URL", "http://localhost:8001")
 UI_SERVICE_URL = os.getenv("UI_SERVICE_URL", "http://localhost:8003")
 TOTAL_SAMPLES = 3000  # 60 seconds × 50 Hz sampling
-ESP32_WS_URL = os.getenv("ESP32_WS_URL", "ws://192.168.4.1:81/")  # Configurable ESP32 WebSocket URL
 
-# Data storage configuration
-DATA_STORAGE_DIR = Path("ppg_data")  # Directory to store collected data
-DATA_STORAGE_DIR.mkdir(exist_ok=True)  # Create directory if it doesn't exist
+# Data storage configuration (only used if ENABLE_CSV_SAVE=True)
+DATA_STORAGE_DIR = Path("ppg_data")
+if ENABLE_CSV_SAVE:
+    DATA_STORAGE_DIR.mkdir(exist_ok=True)
 
 # Global state
-connected_ws_app: WebSocketApp | None = None
-ws_thread: threading.Thread | None = None
-ws_url_in_use: str | None = None
 save_triggered = False
-
 ppg_buffer = []
-collection_status = "IDLE"
+collection_status = "ESP32 Not Connected"
 main_event_loop: asyncio.AbstractEventLoop | None = None
+
+# Collection history - stores each completed 3000-sample collection
+# Each entry: {timestamp, samples, glucose, resp_rate, quality_score, csv_file, ...}
+collection_history = []
 
 # Track collection metadata
 collection_metadata = {
@@ -67,7 +61,7 @@ collection_metadata = {
     "duration_seconds": 60,
     "device_name": ESP32_DEVICE_NAME,
     "last_saved_file": None,
-    # ESP32 precise timing (received via WebSocket)
+    # ESP32 precise timing (received via HTTP)
     "esp32_duration_seconds": None,
     "esp32_sample_rate": None,
 }
@@ -76,19 +70,13 @@ state_lock = threading.Lock()
 
 
 async def post_with_retry(client: httpx.AsyncClient, url: str, json=None, retries: int = 3, backoff: float = 1.0):
-    """Helper: POST with retries and exponential backoff.
-
-    Raises the last exception if all retries fail.
-    Returns the httpx.Response on success.
-    """
-    last_exc = None
+    """Helper: POST with retries and exponential backoff."""
     for attempt in range(1, retries + 1):
         try:
             logger.info(f"POST attempt {attempt}/{retries} -> {url}")
             resp = await client.post(url, json=json)
             return resp
         except httpx.RequestError as re:
-            last_exc = re
             logger.warning(f"POST attempt {attempt} failed: {re}")
             if attempt < retries:
                 sleep_for = backoff * (2 ** (attempt - 1))
@@ -98,16 +86,12 @@ async def post_with_retry(client: httpx.AsyncClient, url: str, json=None, retrie
                 logger.error(f"All {retries} POST attempts failed for {url}")
                 raise
         except Exception as e:
-            last_exc = e
             logger.exception(f"Unexpected error during POST attempt {attempt}: {e}")
             raise
 
 
-
 def _response_to_dict(resp: object) -> dict:
-    """Convert an httpx.Response with status 200 to a dict without calling .json().
-    Falls back to {"success": False}.
-    """
+    """Convert an httpx.Response with status 200 to a dict."""
     try:
         if isinstance(resp, httpx.Response) and getattr(resp, "status_code", None) == 200:
             text = getattr(resp, "text", "") or "{}"
@@ -116,8 +100,6 @@ def _response_to_dict(resp: object) -> dict:
         pass
     return {"success": False}
 
-class CollectionRequest(BaseModel):
-    action: str
 
 class CollectionStatus(BaseModel):
     status: str
@@ -125,52 +107,25 @@ class CollectionStatus(BaseModel):
     total_samples: int
     last_saved_file: str | None = None
 
+
 @app.on_event("startup")
 async def _startup():
-    """
-    Startup: capture event loop and try automatic ESP32 connection.
-    """
+    """Startup: capture event loop."""
     global main_event_loop
     main_event_loop = asyncio.get_event_loop()
-    logger.info("[Startup] Captured event loop for thread callbacks")
+    logger.info("[Startup] HTTP receiver service ready")
+    logger.info("[Startup] Waiting for ESP32 to POST data chunks")
 
-    ws_url = "ws://192.168.4.1:81/"
-    max_retries = 5
-
-    for attempt in range(1, max_retries + 1):
-        if collection_status != "READY":
-            try:
-                logger.info(f"[Auto-Connect] Attempt {attempt} to connect to ESP32 at {ws_url}")
-                _start_ws_thread(ws_url)
-                await asyncio.sleep(3.0)  # Wait for connection
-            
-                # Check if actually connected
-                if collection_status == "READY":
-                    logger.info(f"[Auto-Connect] Successfully connected on attempt {attempt}")
-                    break
-                else:
-                    logger.warning(f"[Auto-Connect] Attempt {attempt} - status is {collection_status}, retrying...")
-                    # Wait for the previous thread to finish before cleanup
-                    if ws_thread and ws_thread.is_alive():
-                        logger.info(f"[Auto-Connect] Waiting for previous attempt to finish...")
-                        ws_thread.join(timeout=3)
-                    _disconnect_device_sync()  # Clean up failed connection
-                    await asyncio.sleep(2)
-            except Exception as e:
-                logger.warning(f"[Auto-Connect] Attempt {attempt} failed: {e}")
-                await asyncio.sleep(3)
-        
-    else:
-        logger.error(f"[Auto-Connect] All {max_retries} attempts failed.")
 
 @app.get("/")
 async def root():
     return {
-        "service": "WebSocket Receiver",
+        "service": "HTTP Receiver",
         "status": collection_status,
         "samples_received": len(ppg_buffer),
         "last_saved_file": collection_metadata.get("last_saved_file")
     }
+
 
 @app.get("/status")
 async def get_status():
@@ -181,228 +136,139 @@ async def get_status():
         last_saved_file=collection_metadata.get("last_saved_file")
     )
 
-def _on_ws_open(ws):
-    global collection_status
-    logger.info("WebSocket connection opened")
-    with state_lock:
-        collection_status = "CONNECTED"
 
-def _on_ws_close(ws, close_status_code, close_msg):
-    global collection_status
-    logger.info(f"WebSocket closed: code={close_status_code}, msg={close_msg}")
-    with state_lock:
-        collection_status = "DISCONNECTED"
-    logger.info("Cleaned up WebSocket connection on close")
-
-def _on_ws_error(ws, error):
-    global collection_status
-    logger.error(f"WebSocket error: {error}")
-    with state_lock:
-        collection_status = "ERROR"
-
-def _on_ws_message(ws, message):
-    global ppg_buffer, collection_status
-
-    # Binary data (chunks)
-    if isinstance(message, (bytes, bytearray)):
-        data = message
-        logger.info(f"[DEBUG] Received BINARY message, length: {len(data)} bytes")
-        try:
-            if len(data) < 4:
-                logger.error("Received binary message too short")
-                return
-
-            chunk_num = struct.unpack('<H', data[0:2])[0]
-            total_chunks = data[2]
-            sample_count = data[3]
-            
-            logger.info(f"[DEBUG] Chunk header: num={chunk_num}, total={total_chunks}, samples={sample_count}")
-
-            samples = []
-            for i in range(sample_count):
-                offset = 4 + i * 2
-                if offset + 2 <= len(data):
-                    sample = struct.unpack('<H', data[offset:offset+2])[0]
-                    samples.append(sample)
-
-            with state_lock:
-                ppg_buffer.extend(samples)
-                total_received = len(ppg_buffer)
-
-            logger.info(f"Received chunk {chunk_num + 1}/{total_chunks}: {len(samples)} samples (total: {total_received})")
-
-            global save_triggered
-
-            # If collection complete, schedule processing and stop device streaming
-            if total_received >= TOTAL_SAMPLES and not save_triggered:
-                save_triggered = True  # ✅ Prevent re-triggering
-                collection_metadata["end_time"] = datetime.now()
-
-                # Proactively send STOP/CANCEL to ESP32 to halt further streaming
-                try:
-                    ws.send("C")
-                    logger.info("Sent STOP command to ESP32 (TOTAL_SAMPLES reached)")
-                except Exception as e:
-                    logger.warning(f"Failed to send STOP to ESP32: {e}")
-
-                logger.info("Buffer reached TOTAL_SAMPLES, scheduling save and processing")
-                if main_event_loop:
-                    asyncio.run_coroutine_threadsafe(
-                        save_and_process_data(),
-                        main_event_loop
-                    )
-
-        except Exception as e:
-            logger.exception(f"Error processing binary message: {e}")
-        return
-
-    # Text messages
+@app.post("/receive_chunk")
+async def receive_chunk(request: Request):
+    """
+    Receive binary PPG data chunk via HTTP POST from ESP32.
+    Automatically resets buffer when Chunk 0 arrives.
+    Triggers processing when all samples are received.
+    """
+    global ppg_buffer, collection_status, save_triggered
+    
     try:
-        msg = message
-        logger.debug(f"Text WS message: {msg}")
-
-        if isinstance(msg, str) and msg.strip().startswith('{'):
-            import json
-            try:
-                js = json.loads(msg)
-                ev = js.get("event")
-                if ev == "status":
-                    status_val = js.get("status")
-                    if status_val:
-                        with state_lock:
-                            collection_status = status_val
-                        logger.info(f"ESP32 status: {status_val}")
-                elif ev == "progress":
-                    logger.info(f"ESP32 progress: {js.get('progress')}%")
-                elif ev == "transmission":
-                    logger.info(f"Transmission progress: {js.get('progress')}")
-                elif ev == "collection_complete":
-                    # Store ESP32's precise timing metadata
-                    collection_metadata["esp32_duration_seconds"] = js.get("duration_seconds")
-                    collection_metadata["esp32_sample_rate"] = js.get("actual_sample_rate")
-                    logger.info(f"ESP32 timing: {js.get('duration_seconds'):.2f}s @ {js.get('actual_sample_rate'):.2f} Hz")
-            except Exception as je:
-                logger.debug(f"Failed to parse JSON: {je}")
-                with state_lock:
-                    collection_status = msg
-        else:
-            with state_lock:
-                collection_status = msg
-            logger.info(f"ESP32 Status: {msg}")
-
-    except Exception as e:
-        logger.exception(f"Error processing text message: {e}")
-
-@app.post("/connect")
-async def connect_device():
-    "Reconnect to ESP32 WebSocket using default URL"
-    global connected_ws_app, collection_status, ws_url_in_use, ESP32_WS_URL
-
-    if collection_status != "DISCONNECTED" :
-        logger.info("WebSocket client already connected")
-        with state_lock:
-            current_status = collection_status  # Read under lock
-        return {"status": current_status}
-    
-    if connected_ws_app is not None:
-        logger.info("Cleaning up existing connection before reconnecting...")
-        _disconnect_device_sync()
-        await asyncio.sleep(0.5)  # Brief pause for cleanup
-    
-    logger.info(f"Connect request received for {ESP32_WS_URL}")
-    
-    _start_ws_thread(ESP32_WS_URL)
-    logger.info(f"Connecting to ESP32 at {ESP32_WS_URL}...")
-    await asyncio.sleep(2.0)  # Give time for connection to establish
-    with state_lock:
-        current_status = collection_status  # Read under lock
-    return {"status": current_status}
-    
-
-def _start_ws_thread(ws_url):
-    global connected_ws_app, ws_thread, ws_url_in_use, ESP32_WS_URL
-
-    if connected_ws_app is not None:
-        logger.info("WebSocket client already running")
-        return
-
-    logger.info(f"Starting WebSocket client for {ws_url}")
-    connected_ws_app = WebSocketApp(
-        ws_url,
-        on_open=_on_ws_open,
-        on_message=_on_ws_message,
-        on_error=_on_ws_error,
-        on_close=_on_ws_close
-    )
-
-    def run_ws():
-        try:
-            connected_ws_app.run_forever(reconnect=0,)
-        except Exception as e:
-            logger.exception(f"WebSocket run_forever terminated: {e}")
-        finally:
-            logger.info("WebSocket thread terminated")
-            with state_lock:
-                global collection_status
-                collection_status = "DISCONNECTED"
-
-    ws_thread = threading.Thread(target=run_ws, name="ws-thread", daemon=True)
-    ws_thread.start()
-    ws_url_in_use = ws_url
-
-@app.post("/collect")
-async def start_collection():
-    global ppg_buffer, collection_status, connected_ws_app, collection_metadata
-
-    with state_lock:
-        if connected_ws_app is None:
-            raise HTTPException(status_code=400, detail="Not connected")
-
-    try:
-        with state_lock:
-            ppg_buffer = []
-            collection_status = "COLLECTING"
-            current_status = collection_status  # Copy to local variable
-            # Record start time
-            collection_metadata["start_time"] = datetime.now()
-            collection_metadata["end_time"] = None
-            collection_metadata["last_saved_file"] = None
-            # Reset flags and set defaults; will be corrected after capture
-            global save_triggered
-            save_triggered = False
-            collection_metadata["sample_rate"] = 50
-            collection_metadata["duration_seconds"] = 60
-
-        if connected_ws_app:
-            try:
-                connected_ws_app.send("S")
-                logger.info("Sent START command to ESP32")
-            except Exception as e:
-                logger.exception(f"Failed to send start command: {e}")
-                raise
-            with state_lock:
-                current_status = collection_status  # Read under lock
+        # Get metadata from headers
+        chunk_num = int(request.headers.get("X-Chunk-Number", 0))
+        total_chunks = int(request.headers.get("X-Total-Chunks", 1))
         
-        return {"status": current_status}
+        # Read binary data
+        data = await request.body()
+        
+        logger.info(f"[DEBUG] Received BINARY HTTP POST, length: {len(data)} bytes")
+        
+        if len(data) < 4:
+            logger.error("Received binary message too short")
+            raise HTTPException(status_code=400, detail="Invalid chunk data")
+        
+        # Parse header (same format as original)
+        chunk_num_data = struct.unpack('<H', data[0:2])[0]
+        total_chunks_data = data[2]
+        sample_count_data = data[3]
+        
+        logger.info(f"[DEBUG] Chunk header: num={chunk_num_data}, total={total_chunks_data}, samples={sample_count_data}")
+        
+        # AUTOMATIC RESET: If this is the first chunk, clear buffer and reset state
+        if chunk_num_data == 0:
+            with state_lock:
+                logger.info("Received Chunk 0 - Auto-resetting buffer for new collection")
+                ppg_buffer = []
+                collection_status = "COLLECTING"
+                collection_metadata["start_time"] = datetime.now()
+                collection_metadata["end_time"] = None
+                collection_metadata["last_saved_file"] = None
+                collection_metadata["esp32_duration_seconds"] = None
+                collection_metadata["esp32_sample_rate"] = None
+                save_triggered = False
+        
+        # Extract samples
+        samples = []
+        for i in range(sample_count_data):
+            offset = 4 + i * 2
+            if offset + 2 <= len(data):
+                sample = struct.unpack('<H', data[offset:offset+2])[0]
+                samples.append(sample)
+        
+        # Add to buffer
+        with state_lock:
+            ppg_buffer.extend(samples)
+            total_received = len(ppg_buffer)
+        
+        logger.info(f"Received chunk {chunk_num + 1}/{total_chunks}: {len(samples)} samples (total: {total_received})")
+        
+        return {
+            "success": True,
+            "chunk": chunk_num,
+            "samples_received": len(samples),
+            "total_samples": total_received
+        }
+        
     except Exception as e:
-        logger.exception(f"Failed to start collection: {e}")
+        logger.exception(f"Error processing chunk: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/collection_complete")
+async def collection_complete(request: Request):
+    """
+    Receive collection metadata from ESP32 after all chunks sent.
+    This triggers the data processing pipeline.
+    """
+    global save_triggered
+    
+    try:
+        data = await request.json()
+        
+        # Store ESP32's precise timing metadata
+        collection_metadata["esp32_duration_seconds"] = data.get("duration_seconds")
+        collection_metadata["esp32_sample_rate"] = data.get("actual_sample_rate")
+        collection_metadata["end_time"] = datetime.now()
+        
+        duration = data.get('duration_seconds', 0)
+        rate = data.get('actual_sample_rate', 0)
+        logger.info(f"ESP32 timing: {duration:.2f}s @ {rate:.2f} Hz")
+        
+        # Trigger processing now that we have the metadata
+        if not save_triggered:
+            save_triggered = True
+            logger.info("Collection complete - triggering save and processing...")
+            if main_event_loop:
+                asyncio.run_coroutine_threadsafe(
+                    save_and_process_data(),
+                    main_event_loop
+                )
+        
+        return {"success": True}
+    except Exception as e:
+        logger.exception(f"Error processing collection_complete: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/status_update")
+async def status_update(request: Request):
+    """Receive status updates from ESP32 (optional, for monitoring)."""
+    global collection_status
+    
+    try:
+        data = await request.json()
+        status_msg = data.get("status", "")
+        
+        with state_lock:
+            collection_status = status_msg
+        
+        logger.info(f"ESP32 status update: {status_msg}")
+        
+        return {"success": True}
+    except Exception as e:
+        logger.exception(f"Error processing status: {e}")
+        return {"success": False, "error": str(e)}
+
+
 # ============================================================================
-# NEW FUNCTION: Save PPG Data to Multiple Formats
+# Save PPG Data to Multiple Formats
 # ============================================================================
 
 async def save_ppg_data(ppg_signal: np.ndarray) -> dict:
-    """
-    Save PPG data to disk in multiple formats
-    
-    Args:
-        ppg_signal: Unscaled PPG data as numpy array
-    
-    Returns:
-        dict with file paths and metadata
-    """
+    """Save PPG data to disk in multiple formats."""
     try:
         # Generate timestamp-based filename
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -427,83 +293,37 @@ async def save_ppg_data(ppg_signal: np.ndarray) -> dict:
         }
         
         saved_files = {}
-        
-        # ======================================================================
-        # FORMAT 1: NumPy Binary Format (.npy) - Fast loading, preserves dtype
-        # ======================================================================
-        npy_path = DATA_STORAGE_DIR / f"{base_filename}.npy"
-        np.save(npy_path, ppg_signal)
-        saved_files["npy"] = str(npy_path)
-        logger.info(f"Saved NumPy binary: {npy_path}")
-        
-        # ======================================================================
-        # FORMAT 2: CSV Format - Human readable, universal compatibility
-        # ======================================================================
+
+        # FORMAT 2: CSV Format
         csv_path = DATA_STORAGE_DIR / f"{base_filename}.csv"
         with open(csv_path, 'w', newline='') as f:
             writer = csv.writer(f)
-            # Write header
             writer.writerow(['Sample_Index', 'IR_Value', 'Timestamp_ms'])
-            # Write data
             for i, value in enumerate(ppg_signal):
                 timestamp_ms = (i / collection_metadata["sample_rate"]) * 1000
                 writer.writerow([i, int(value), f"{timestamp_ms:.2f}"])
         saved_files["csv"] = str(csv_path)
         logger.info(f"Saved CSV: {csv_path}")
         
-        # ======================================================================
-        # FORMAT 3: JSON Format - With metadata, easily parseable
-        # ======================================================================
+        # FORMAT 3: JSON Format - With metadata
         json_path = DATA_STORAGE_DIR / f"{base_filename}.json"
         json_data = {
             "metadata": metadata,
-            "data": ppg_signal.tolist()  # Convert numpy array to Python list
+            "data": ppg_signal.tolist()
         }
         with open(json_path, 'w') as f:
             json.dump(json_data, f, indent=2)
         saved_files["json"] = str(json_path)
         logger.info(f"Saved JSON: {json_path}")
         
-        # ======================================================================
-        # FORMAT 4: Metadata-only JSON - Quick reference
-        # ======================================================================
-        meta_path = DATA_STORAGE_DIR / f"{base_filename}_metadata.json"
-        with open(meta_path, 'w') as f:
-            json.dump(metadata, f, indent=2)
-        saved_files["metadata"] = str(meta_path)
-        logger.info(f"Saved metadata: {meta_path}")
-        
-        # ======================================================================
-        # FORMAT 5: Text Summary - Human-readable report
-        # ======================================================================
-        summary_path = DATA_STORAGE_DIR / f"{base_filename}_summary.txt"
-        with open(summary_path, 'w') as f:
-            f.write("=" * 60 + "\n")
-            f.write("PPG DATA COLLECTION SUMMARY\n")
-            f.write("=" * 60 + "\n\n")
-            f.write(f"Collection Timestamp: {timestamp}\n")
-            f.write(f"Start Time: {metadata['start_time']}\n")
-            f.write(f"End Time: {metadata['end_time']}\n")
-            f.write(f"Device: {metadata['device_name']}\n\n")
-            f.write(f"Sample Rate: {metadata['sample_rate']} Hz\n")
-            f.write(f"Total Samples: {metadata['total_samples']}\n")
-            f.write(f"Duration: {metadata['duration_seconds']} seconds\n\n")
-            f.write("Signal Statistics:\n")
-            f.write(f"  Mean:   {metadata['signal_stats']['mean']:.2f}\n")
-            f.write(f"  Std:    {metadata['signal_stats']['std']:.2f}\n")
-            f.write(f"  Min:    {metadata['signal_stats']['min']:.2f}\n")
-            f.write(f"  Max:    {metadata['signal_stats']['max']:.2f}\n")
-            f.write(f"  Median: {metadata['signal_stats']['median']:.2f}\n\n")
-            f.write("=" * 60 + "\n")
-            f.write("Data Files:\n")
-            f.write("=" * 60 + "\n")
-            for format_name, file_path in saved_files.items():
-                f.write(f"  {format_name.upper()}: {file_path}\n")
-        saved_files["summary"] = str(summary_path)
-        logger.info(f"Saved summary: {summary_path}")
+        # FORMAT 4: NPY Format - For fast numpy loading
+        npy_path = DATA_STORAGE_DIR / f"{base_filename}.npy"
+        np.save(npy_path, ppg_signal)
+        saved_files["npy"] = str(npy_path)
+        logger.info(f"Saved NPY: {npy_path}")
         
         # Update global metadata
-        collection_metadata["last_saved_file"] = str(npy_path)
+        collection_metadata["last_saved_file"] = str(csv_path)
         
         logger.info(f"Successfully saved PPG data in {len(saved_files)} formats")
         
@@ -516,14 +336,11 @@ async def save_ppg_data(ppg_signal: np.ndarray) -> dict:
         
     except Exception as e:
         logger.exception(f"Error saving PPG data: {e}")
-        return {
-            "success": False,
-            "error": str(e)
-        }
+        return {"success": False, "error": str(e)}
 
 
 # ============================================================================
-# MODIFIED FUNCTION: Save Data THEN Process
+# Save Data THEN Process
 # ============================================================================
 
 async def save_and_process_data():
@@ -551,19 +368,16 @@ async def save_and_process_data():
         ppg_signal = ppg_signal * 4
         logger.info(f"Unscaled data: mean={ppg_signal.mean():.2f}, std={ppg_signal.std():.2f}")
         
-        # Use ESP32's precise timing (from esp_timer) if available, otherwise fallback to Python timestamps
+        # Use ESP32's precise timing if available
         esp32_duration = collection_metadata.get("esp32_duration_seconds")
         esp32_rate = collection_metadata.get("esp32_sample_rate")
         
         if esp32_duration and esp32_rate:
-            # PREFERRED: Use ESP32's esp_timer measurements (microsecond precision)
             duration_seconds = float(esp32_duration)
             effective_fs = float(esp32_rate)
-            logger.info(
-                f"[Timing] Using ESP32 precise timing: duration={duration_seconds:.3f}s, fs={effective_fs:.2f} Hz"
-            )
+            logger.info(f"[Timing] Using ESP32 precise timing: duration={duration_seconds:.3f}s, fs={effective_fs:.2f} Hz")
         else:
-            # FALLBACK: Compute from Python wall-clock timestamps (includes transmission delays)
+            # Fallback: Compute from Python wall-clock timestamps
             start_time = collection_metadata.get("start_time")
             end_time = collection_metadata.get("end_time")
             duration_seconds = None
@@ -575,9 +389,7 @@ async def save_and_process_data():
             if not duration_seconds or duration_seconds <= 0:
                 duration_seconds = float(len(ppg_signal)) / 50.0 if len(ppg_signal) > 0 else 0.0
             effective_fs = float(len(ppg_signal)) / duration_seconds if duration_seconds > 0 else 50.0
-            logger.warning(
-                f"[Timing] ESP32 timing not available, using fallback: duration={duration_seconds:.3f}s, fs={effective_fs:.2f} Hz"
-            )
+            logger.warning(f"[Timing] ESP32 timing not available, using fallback: duration={duration_seconds:.3f}s, fs={effective_fs:.2f} Hz")
 
         # Update metadata for saving and downstream services
         collection_metadata["duration_seconds"] = float(duration_seconds)
@@ -585,7 +397,7 @@ async def save_and_process_data():
 
         csv_file_path = None
         
-        # Step 3: OPTIONALLY SAVE DATA TO DISK (archival)
+        # Step 3: OPTIONALLY SAVE DATA TO DISK
         if ENABLE_CSV_SAVE:
             logger.info("=" * 60)
             logger.info("SAVING PPG DATA TO DISK")
@@ -594,7 +406,7 @@ async def save_and_process_data():
             save_result = await save_ppg_data(ppg_signal)
             
             if save_result["success"]:
-                logger.info(f"✓ Data saved successfully!")
+                logger.info("✓ Data saved successfully!")
                 csv_file_path = save_result['files'].get('csv')
                 logger.info(f"✓ CSV saved at: {csv_file_path}")
                 for format_name, file_path in save_result['files'].items():
@@ -606,17 +418,15 @@ async def save_and_process_data():
         else:
             logger.info("CSV saving disabled (ENABLE_CSV_SAVE=False)")
         
-    # Step 4: Run glucose and respiratory preprocessing in parallel, then notify UI
-        logger.info("Sending data to preprocessing service: /preprocess and /preprocess_respiratory in parallel...")
+        # Step 4: Run glucose and respiratory preprocessing in parallel
+        logger.info("Sending data to preprocessing service...")
 
         async with httpx.AsyncClient(timeout=90.0) as client:
             try:
                 glucose_task = post_with_retry(
                     client,
                     f"{PREPROCESSING_SERVICE_URL}/preprocess",
-                    json={
-                        "signal": ppg_signal.tolist(),
-                    },
+                    json={"signal": ppg_signal.tolist()},
                     retries=3,
                     backoff=1.0,
                 )
@@ -633,7 +443,7 @@ async def save_and_process_data():
 
                 glucose_response, resp_response = await asyncio.gather(glucose_task, resp_task, return_exceptions=True)
 
-                # Basic error handling (runtime-safe and type-checker-friendly)
+                # Handle glucose response
                 glucose_json = {"success": False}
                 if isinstance(glucose_response, Exception):
                     logger.error(f"Glucose preprocessing exception: {glucose_response}")
@@ -645,6 +455,7 @@ async def save_and_process_data():
                         txt = getattr(glucose_response, "text", "")
                         logger.error(f"Glucose preprocessing returned {status}: {txt}")
 
+                # Handle respiratory response
                 resp_json = {"success": False}
                 if isinstance(resp_response, Exception):
                     logger.error(f"Respiratory preprocessing exception: {resp_response}")
@@ -708,8 +519,22 @@ async def save_and_process_data():
                 logger.info(f"  - Segments: {combined['num_segments']}")
                 logger.info(f"  - Respiratory Rate: {combined.get('resp_rate_bpm')} bpm")
 
+                # Append to collection history
+                history_entry = {
+                    "timestamp": datetime.now().isoformat(),
+                    "samples": len(ppg_signal),
+                    "glucose": glucose_value,
+                    "resp_rate_bpm": resp_json.get("resp_rate_bpm"),
+                    "quality_score": float(glucose_json.get("quality_score", 0.0) or 0.0),
+                    "num_segments": int(glucose_json.get("num_segments", 0) or 0),
+                    "csv_file": csv_file_path,
+                    "esp32_duration": esp32_duration,
+                    "esp32_rate": esp32_rate,
+                }
                 with state_lock:
+                    collection_history.append(history_entry)
                     collection_status = "COMPLETE"
+                logger.info(f"✓ Added to collection history (total: {len(collection_history)} entries)")
 
                 return {
                     "success": True,
@@ -730,61 +555,29 @@ async def save_and_process_data():
         return {"success": False, "error": str(e)}
 
 
-def _disconnect_device_sync():
-    """Synchronous disconnect helper - can be called from any thread"""
-    global connected_ws_app, ws_thread, ws_url_in_use, collection_status
+# ============================================================================
+# COLLECTION HISTORY ENDPOINT
+# ============================================================================
 
-    if connected_ws_app:
-        try:
-            connected_ws_app.close()
-            time.sleep(0.2)
-        except Exception as e:
-            logger.exception(f"Error closing WebSocket: {e}")
-
-    connected_ws_app = None
-    ws_thread = None
-    ws_url_in_use = None
+@app.get("/collection_history")
+async def get_collection_history():
+    """Get history of all completed collections."""
     with state_lock:
-        collection_status = "DISCONNECTED"
-    logger.info("Disconnected from ESP32")
+        history_copy = list(collection_history)
+    return {
+        "total_collections": len(history_copy),
+        "history": history_copy
+    }
 
-
-@app.post("/stop")
-async def stop_collection():
-    global connected_ws_app, collection_status
-
-    with state_lock:
-        if connected_ws_app is None:
-            raise HTTPException(status_code=400, detail="Not connected")
-
-    try:
-        if connected_ws_app:
-            connected_ws_app.send("C")
-            logger.info("Sent STOP command to ESP32")
-        with state_lock:
-            collection_status = "STOPPED"
-            current_status = collection_status  # Copy to local variable
-        return {"status": current_status}
-    except Exception as e:
-        logger.exception(f"Failed to stop: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/disconnect")
-async def disconnect_device():
-    """FastAPI endpoint - async wrapper for sync disconnect"""
-    _disconnect_device_sync()
-    return {"status": "disconnected"}
 
 # ============================================================================
-# DOWNLOAD ENDPOINTS (conditionally registered based on ENABLE_DOWNLOAD_ENDPOINTS)
+# DOWNLOAD ENDPOINTS (conditionally registered)
 # ============================================================================
 
 if ENABLE_DOWNLOAD_ENDPOINTS:
     @app.get("/saved_data")
     async def list_saved_data():
-        """
-        List all saved PPG data files
-        """
+        """List all saved PPG data files."""
         try:
             files = {
                 "npy": sorted(DATA_STORAGE_DIR.glob("*.npy")),
@@ -808,9 +601,7 @@ if ENABLE_DOWNLOAD_ENDPOINTS:
 
     @app.get("/download/{filename}")
     async def download_file(filename: str):
-        """
-        Download a specific saved data file
-        """
+        """Download a specific saved data file."""
         file_path = DATA_STORAGE_DIR / filename
         
         if not file_path.exists():

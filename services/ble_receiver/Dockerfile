@@ -21,4 +21,5 @@ COPY Wifi_main_csv.py .
 EXPOSE 8000
 
 # Run the FastAPI Wi-Fi receiver
-CMD ["uvicorn", "Wifi_main_csv:app", "--host", "0.0.0.0", "--port", "8000"]
+# Cloud Run sets PORT env var, fallback to 8000 for local/docker-compose
+CMD ["sh", "-c", "uvicorn Wifi_main_csv:app --host 0.0.0.0 --port ${PORT:-8000}"]

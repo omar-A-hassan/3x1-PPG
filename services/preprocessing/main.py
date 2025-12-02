@@ -95,7 +95,7 @@ class PPGPreprocessor:
         lowcut=0.4,  # Relaxed from 0.5 to 0.4 Hz for better 50-100 Hz compatibility
         highcut=8.0,
         filter_order=4,
-        similarity_threshold=0.70,
+        similarity_threshold=0.85,
         # Respiratory-focused extras
         resp_lowcut=0.15,
         resp_highcut=0.5,
@@ -252,7 +252,7 @@ class PPGPreprocessor:
             return None
 
         # Step 2: Bandpass filtering
-        filtered_signal = self.bandpass_filter(cleaned_signal)
+        filtered_signal = self.bandpass_filter(cleaned_signal,mode="heart")
         if filtered_signal is None:
             return None
 

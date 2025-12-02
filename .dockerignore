@@ -1,0 +1,39 @@
+# Root-level .dockerignore (for docker-compose builds from root context)
+
+# Python virtual environment
+.venv/
+
+# Python bytecode
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# PPG data files (large, not needed in containers)
+ppg_data/
+
+# ESP32 firmware (not needed for Python services)
+esp32/
+
+# Discovery service (unused)
+services/discovery/
+
+# Logs
+*.log
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# PowerShell scripts (local development only)
+start.ps1
+stop.ps1

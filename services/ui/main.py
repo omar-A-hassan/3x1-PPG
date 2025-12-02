@@ -407,7 +407,7 @@ def create_respiratory_psd_plot(freqs, psd, resp_freq_hz=None):
     
     ax.legend()
     # Limit x-axis to 0-2 Hz for respiratory analysis
-    ax.set_xlim(0, 2.0)
+    ax.set_xlim(0, 1.0)
     
     return fig
 
@@ -474,30 +474,69 @@ async def compute_respiratory_rate(csv_path: Path):
 # GRADIO INTERFACE
 # ============================================================================
 
-def create_gradio_interface():
+def fetch_receiver_status() -> dict:
+    """Fetch current status from the receiver service.
     
-
-    def send_command_sync(endpoint: str):
-        """Synchronous helper for Gradio button callbacks to avoid asyncio.run nested loops.
-
-        Uses httpx sync API for simplicity.
-        """
-        try:
-            resp = httpx.post(f"{RECEIVER_SERVICE_URL}/{endpoint}", timeout=20.0)
+    Uses synchronous httpx since Gradio callbacks are sync by default.
+    Returns dict with status info or error message.
+    """
+    try:
+        # Use synchronous client - simpler and works in Gradio callbacks
+        with httpx.Client(timeout=5.0) as client:
+            resp = client.get(f"{RECEIVER_SERVICE_URL}/status")
             if resp.status_code == 200:
-                data = resp.json()
-                return (f"✅ {endpoint.capitalize()} command sent successfully.  \n"
-                f"🪧 Current Status: {data.get('status')}")
+                return resp.json()
             else:
-                return f"⚠️ Failed: {resp.text}"
-        except Exception as e:
-            return f"❌ Error: {e}"
+                logger.error(f"Failed to fetch status: {resp.status_code}")
+                return {"collection_status": "Error", "error": f"HTTP {resp.status_code}"}
+    except httpx.ConnectError:
+        return {"collection_status": "Disconnected", "error": "Receiver service not reachable"}
+    except httpx.TimeoutException:
+        return {"collection_status": "Timeout", "error": "Request timed out"}
+    except Exception as e:
+        logger.error(f"Error fetching receiver status: {e}")
+        return {"collection_status": "Error", "error": str(e)}
+
+
+def format_status_markdown(status_data: dict) -> str:
+    """Format receiver status data as Markdown for display."""
+    # Receiver returns "status", not "collection_status"
+    collection_status = status_data.get("status", "Unknown")
+    
+    # Map status to emoji
+    status_emoji = {
+        "ESP32 Not Connected": "🔌",
+        "WAITING": "👆(Place Your Finger)",
+        "COLLECTING": "📡",
+        "TRANSMITTING": "📤",
+        "PROCESSING": "⚙️",
+        "COMPLETE": "✅",
+        "READY": "🟢",
+        "Disconnected": "🔴",
+        "Error": "❌",
+        "Timeout": "⏱️",
+    }.get(collection_status, "❓")
+    
+    # Build status line
+    status_line = f"**Status:** {status_emoji} {collection_status}"
+    
+    
+    return status_line
+
+
+def create_gradio_interface():
 
     def get_current_result():
-        """Get latest glucose result"""
+        """Get latest glucose result and receiver status."""
         result = result_state.get_latest()
+        
+        # Fetch live status from receiver service
+        status_data = fetch_receiver_status()
+        status_markdown = format_status_markdown(status_data)
+        
         if result is None:
             return (
+                status_markdown,
                 "No prediction yet",
                 "Waiting for data...",
                 "",
@@ -523,6 +562,7 @@ def create_gradio_interface():
         
         if glucose is None:
             return (
+                status_markdown,
                 "No prediction yet",
                 "Waiting for model result...",
                 "",
@@ -559,7 +599,7 @@ def create_gradio_interface():
 - **141-200 mg/dL:** Elevated 🟡
 - **> 200 mg/dL:** Hyperglycemia (High) 🔴
 """
-        return (display, details, ranges, _get_history_text(), _get_history_plot(), resp_info)
+        return (status_markdown, display, details, ranges, _get_history_text(), _get_history_plot(), resp_info)
 
     def _get_history_text():
         """Get history as markdown text"""
@@ -783,15 +823,12 @@ def create_gradio_interface():
         # ====================================================================
         
         with gr.Tab("📊 Glucose Monitor"):
-            gr.Markdown("## Collection Control")
+            gr.Markdown("## Collection Status")
+            gr.Markdown("*ESP32 runs autonomously - place finger on sensor to start collection*")
             
             with gr.Row():
-                start_btn = gr.Button("▶️ Start Collection", variant="primary", scale=1)
-                stop_btn = gr.Button("⏹ Stop Collection", variant="secondary", scale=1)
-                status_box = gr.Markdown(value="**Status:** Please Refresh ⚠️")
-                with gr.Column(scale=1):
-                    refresh_btn = gr.Button("🔄 Refresh")
-                    reconnect_btn = gr.Button("🔌 Reconnect ESP32 / Refresh Status 🔄", variant="secondary", size="sm")
+                status_box = gr.Markdown(value="**Status:** ⏸️ Refresh status...")
+                refresh_btn = gr.Button("🔄 Refresh Status", variant="primary", scale=1)
 
             gr.Markdown("---")
             gr.Markdown("## Current Prediction")
@@ -814,23 +851,10 @@ def create_gradio_interface():
             with gr.Row():
                 history_plot = gr.Plot(label="Glucose Trends")
 
-            # Button bindings (use synchronous helper to avoid nested event loops)
-            start_btn.click(
-                fn=lambda: send_command_sync("collect"),
-                outputs=status_box,
-            )
-            stop_btn.click(
-                fn=lambda: send_command_sync("stop"),
-                outputs=status_box,
-            )
-
+            # Button bindings
             refresh_btn.click(
-            fn=get_current_result,
-                outputs=[glucose_output, details_output, ranges_output, history_text, history_plot, respiratory_output]
-                )
-            reconnect_btn.click(
-                fn=lambda: send_command_sync("connect"),
-                outputs=status_box,
+                fn=get_current_result,
+                outputs=[status_box, glucose_output, details_output, ranges_output, history_text, history_plot, respiratory_output]
             )
         
         # ====================================================================
@@ -839,7 +863,7 @@ def create_gradio_interface():
         
         with gr.Tab("📈 Signal Analysis"):
             gr.Markdown("## Raw PPG Signal Visualization")
-            gr.Markdown("View time-domain and frequency-domain analysis of collected data (90 seconds)")
+            gr.Markdown("View time-domain and frequency-domain analysis of collected data (60 seconds)")
             
             with gr.Row():
                 plot_btn = gr.Button("🔄 Generate Plots", variant="primary", size="lg")
