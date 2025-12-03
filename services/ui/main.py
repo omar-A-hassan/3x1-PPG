@@ -30,6 +30,7 @@ app = FastAPI(title="UI Service")
 # DEBUG/DEPLOYMENT CONFIGURATION
 # ============================================================================
 ENABLE_CSV_FALLBACK = True  # Download CSV if raw_signal missing from response
+MOCK_AUTH_SERVICE = True    # Set to True to test login without auth service
 # ============================================================================
 
 # Service URLs (configurable via environment variables)
@@ -37,6 +38,7 @@ ENABLE_CSV_FALLBACK = True  # Download CSV if raw_signal missing from response
 # When running under docker-compose set RECEIVER_SERVICE_URL=http://ble_receiver:8000
 RECEIVER_SERVICE_URL = os.getenv("RECEIVER_SERVICE_URL", "http://localhost:8000")
 PREPROCESSING_SERVICE_URL = os.getenv("PREPROCESSING_SERVICE_URL", "http://localhost:8001")
+AUTH_SERVICE_URL = os.getenv("AUTH_SERVICE_URL", "http://localhost:8004")
 
 # Path to saved PPG data (matches receiver service)
 PPG_DATA_DIR = Path("ppg_data")  # Adjust if receiver saves elsewhere
@@ -161,6 +163,24 @@ class ResultState:
 
 result_state = ResultState()
 
+class AuthState:
+    """Track logged-in user session"""
+    def __init__(self):
+        self.username = None
+        self.api_key = None
+    
+    def login(self, username: str, api_key: str):
+        self.username = username
+        self.api_key = api_key
+    
+    def logout(self):
+        self.username = None
+        self.api_key = None
+    
+    def is_logged_in(self) -> bool:
+        return self.username is not None
+
+auth_state = AuthState()
 
 @app.post("/update_result")
 async def update_result(request: UpdateResultRequest):
@@ -526,6 +546,87 @@ def format_status_markdown(status_data: dict) -> str:
 
 def create_gradio_interface():
 
+    # ========================================================================
+    # AUTH HANDLER FUNCTIONS
+    # ========================================================================
+    
+    def handle_login(username: str, password: str):
+        """Call auth service to login, or use mock mode for testing"""
+        if not username or not password:
+            return "❌ Please enter username and password", ""
+        
+        # MOCK MODE: For testing without auth service
+        if MOCK_AUTH_SERVICE:
+            # Accept any username/password, generate fake API key
+            import random
+            import string
+            fake_key = ''.join(random.choices(string.ascii_uppercase, k=3)) + str(random.randint(10, 99))
+            auth_state.login(username, fake_key)
+            logger.info(f"[MOCK] Login successful for {username}, API key: {fake_key}")
+            return f"✅ Logged in as **{username}** (MOCK MODE)", fake_key
+        
+        # REAL MODE: Call auth service
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                resp = client.post(
+                    f"{AUTH_SERVICE_URL}/login",
+                    json={"username": username, "password": password}
+                )
+                data = resp.json()
+                
+                if resp.status_code == 200 and data.get("success"):
+                    auth_state.login(username, data["api_key"])
+                    return f"✅ Logged in as **{username}**", data["api_key"]
+                else:
+                    return f"❌ {data.get('error', 'Login failed')}", ""
+        except httpx.ConnectError:
+            return "❌ Auth service not reachable", ""
+        except Exception as e:
+            logger.error(f"Login error: {e}")
+            return f"❌ Error: {e}", ""
+
+    def handle_logout():
+        """Clear login session"""
+        auth_state.logout()
+        return "🔒 Logged out", ""
+
+    def handle_regenerate_key(username: str, password: str):
+        """Request new API key from auth service"""
+        if not auth_state.is_logged_in():
+            return "❌ Please login first", ""
+        
+        # MOCK MODE: Generate new fake key
+        if MOCK_AUTH_SERVICE:
+            import random
+            import string
+            new_key = ''.join(random.choices(string.ascii_uppercase, k=3)) + str(random.randint(10, 99))
+            auth_state.api_key = new_key
+            logger.info(f"[MOCK] Regenerated API key: {new_key}")
+            return f"✅ New API key generated (MOCK MODE)", new_key
+        
+        # REAL MODE: Call auth service
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                resp = client.post(
+                    f"{AUTH_SERVICE_URL}/regenerate-api-key",
+                    json={"username": username, "password": password}
+                )
+                data = resp.json()
+                
+                if resp.status_code == 200 and data.get("success"):
+                    new_key = data["new_api_key"]
+                    auth_state.api_key = new_key
+                    return f"✅ New API key generated", new_key
+                else:
+                    return f"❌ {data.get('error', 'Failed')}", auth_state.api_key or ""
+        except Exception as e:
+            logger.error(f"Regenerate key error: {e}")
+            return f"❌ Error: {e}", auth_state.api_key or ""
+
+    # ========================================================================
+    # GLUCOSE DISPLAY FUNCTIONS
+    # ========================================================================
+
     def get_current_result():
         """Get latest glucose result and receiver status."""
         result = result_state.get_latest()
@@ -815,6 +916,46 @@ def create_gradio_interface():
     # ========================================================================
     
     with gr.Blocks(title="PPG Glucose Monitor") as interface:
+        with gr.Tab("🔐 Login"):
+            gr.Markdown("## User Authentication")
+            gr.Markdown("Login to get your API key for ESP32 configuration")
+            
+            with gr.Row():
+                with gr.Column(scale=1):
+                    username_input = gr.Textbox(label="Username", placeholder="Enter username")
+                    password_input = gr.Textbox(label="Password", type="password", placeholder="Enter password")
+                    
+                    with gr.Row():
+                        login_btn = gr.Button("🔑 Login", variant="primary")
+                        logout_btn = gr.Button("🚪 Logout", variant="secondary")
+            
+            login_status = gr.Markdown("Not logged in")
+            
+            gr.Markdown("---")
+            gr.Markdown("## Your API Key")
+            gr.Markdown("*Copy this key to your ESP32 configuration*")
+            
+            api_key_display = gr.Textbox(label="API Key", value="", interactive=False)
+            regenerate_btn = gr.Button("🔄 Generate New Key")
+            
+            # Connect buttons to functions
+            login_btn.click(
+                fn=handle_login,
+                inputs=[username_input, password_input],
+                outputs=[login_status, api_key_display]
+            )
+            
+            logout_btn.click(
+                fn=handle_logout,
+                outputs=[login_status, api_key_display]
+            )
+            
+            regenerate_btn.click(
+                fn=handle_regenerate_key,
+                inputs=[username_input, password_input],
+                outputs=[login_status, api_key_display]
+            )
+        gr.Markdown("---")
         gr.Markdown("# 🩸 PPG-Based Glucose Monitor")
         gr.Markdown("")
         

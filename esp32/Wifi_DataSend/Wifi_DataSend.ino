@@ -22,6 +22,8 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <WebServer.h>
+#include <Preferences.h>
 
 // ---------- CONFIGURATION ----------
 #define I2C_SDA 21
@@ -31,20 +33,11 @@
 #define TOTAL_SAMPLES 3000    // 60 seconds × 50 Hz = 3000 samples
 #define SAMPLE_INTERVAL_US 20000  // 20,000 µs = 20 ms = 50 Hz
 
-// WiFi Configuration
-#define WIFI_MODE 0  // 0 = Connect to existing WiFi, 1 = ESP32 as Access Point
+// WiFi Configuration - Now uses web-based provisioning
+#define AP_SSID "ESP32-PPG-Setup"  // AP name for configuration mode
+#define RESET_BUTTON_PIN 0          // BOOT button on most ESP32 boards
 
-// If WIFI_MODE = 0: Connect to existing network
-#define WIFI_SSID "WE_F49BD4"
-#define WIFI_PASS "lcp20310"
-
-// If WIFI_MODE = 1: ESP32 acts as Access Point
-#define AP_SSID "ESP32-PPG-Glucose"
-
-// Server Configuration - CHANGE THIS to your computer's IP address
-#define SERVER_URL "http://192.168.1.6:8000"  // Your computer's IP on local WiFi
-// ESP32 and computer must be on the same network (192.168.1.x)
-
+// Server endpoint (appended to saved server URL)
 #define SERVER_ENDPOINT "/receive_chunk"
 
 // Quality thresholds
@@ -57,7 +50,16 @@ const int WARMUP_MS = 3000;
 // ---------- GLOBALS ----------
 MAX30105 particleSensor;
 
-// HTTP endpoints
+// Web server for configuration
+WebServer configServer(80);
+Preferences preferences;
+
+// Saved configuration (loaded from Preferences)
+String savedSSID = "";
+String savedPassword = "";
+String savedServerUrl = "";
+
+// HTTP endpoints (built from savedServerUrl)
 String fullServerUrl;
 String statusUrl;
 String completeUrl;
@@ -87,25 +89,126 @@ void IRAM_ATTR onSampleTimer(void* arg) {
 
 // State machine
 enum State {
+  CONFIGURE_WIFI,      // AP mode + web server for provisioning
+  CONNECTING_WIFI,     // Attempting to connect with saved credentials
   IDLE,
   WAITING_FOR_FINGER,
   COLLECTING,
   TRANSMITTING,
   COMPLETE
 };
-State currentState = IDLE;
+State currentState = CONFIGURE_WIFI;
 
 // Statistics
 uint32_t samplesCollected = 0;
 uint32_t poorQualitySamples = 0;
 unsigned long collectionStartTime = 0;
 
-// ---------- WiFi Setup ----------
-void initWiFi() {
-#if WIFI_MODE == 0
-  // Connect to existing WiFi network
+// ---------- Forward Declarations ----------
+void handleConfigureWiFi();
+void handleConnectingWiFi();
+void handleWaitingForFinger();
+void handleCollecting();
+void handleTransmitting();
+void sendStatus(const char* statusMsg);
+bool connectWiFi();
+bool testServerConnection();
+void clearCredentials();
+void startConfigMode();
+
+// ---------- HTML Page for Configuration ----------
+const char* configPageHtml = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ESP32 PPG Setup</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; background: #f0f0f0; }
+    .container { max-width: 400px; margin: 0 auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+    h1 { color: #333; text-align: center; font-size: 24px; }
+    label { display: block; margin-top: 15px; font-weight: bold; color: #555; }
+    input[type="text"], input[type="password"] { width: 100%; padding: 10px; margin-top: 5px; border: 1px solid #ddd; border-radius: 5px; box-sizing: border-box; }
+    input[type="submit"] { width: 100%; padding: 12px; margin-top: 20px; background: #4CAF50; color: white; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; }
+    input[type="submit"]:hover { background: #45a049; }
+    .note { font-size: 12px; color: #888; margin-top: 5px; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>ESP32 PPG Glucose Monitor</h1>
+    <h2 style="text-align:center;color:#666;">WiFi Configuration</h2>
+    <form action="/save" method="POST">
+      <label>WiFi Network Name (SSID)</label>
+      <input type="text" name="ssid" required placeholder="Enter WiFi name">
+      
+      <label>WiFi Password</label>
+      <input type="password" name="password" required placeholder="Enter WiFi password">
+      
+      <label>Server URL</label>
+      <input type="text" name="serverUrl" required placeholder="http://192.168.1.6:8000">
+      <p class="note">For Cloud: https://your-service.run.app</p>
+      
+      <input type="submit" value="Save & Connect">
+    </form>
+  </div>
+</body>
+</html>
+)rawliteral";
+
+// ---------- Web Server Handlers ----------
+void handleConfigRoot() {
+  configServer.send(200, "text/html", configPageHtml);
+}
+
+void handleConfigSave() {
+  if (configServer.hasArg("ssid") && configServer.hasArg("password") && configServer.hasArg("serverUrl")) {
+    savedSSID = configServer.arg("ssid");
+    savedPassword = configServer.arg("password");
+    savedServerUrl = configServer.arg("serverUrl");
+    
+    // Remove trailing slash from server URL if present
+    if (savedServerUrl.endsWith("/")) {
+      savedServerUrl = savedServerUrl.substring(0, savedServerUrl.length() - 1);
+    }
+    
+    // Save to Preferences
+    preferences.putString("ssid", savedSSID);
+    preferences.putString("password", savedPassword);
+    preferences.putString("serverUrl", savedServerUrl);
+    
+    Serial.println("Configuration saved:");
+    Serial.printf("  SSID: %s\n", savedSSID.c_str());
+    Serial.printf("  Server: %s\n", savedServerUrl.c_str());
+    
+    // Send success response
+    String response = "<html><body style='font-family:Arial;text-align:center;padding:50px;'>";
+    response += "<h1>Configuration Saved!</h1>";
+    response += "<p>Connecting to WiFi network: <b>" + savedSSID + "</b></p>";
+    response += "<p>The device will restart and connect to your network.</p>";
+    response += "</body></html>";
+    configServer.send(200, "text/html", response);
+    
+    delay(2000);
+    
+    // Stop AP and web server
+    configServer.stop();
+    WiFi.softAPdisconnect(true);
+    
+    // Transition to connecting state
+    currentState = CONNECTING_WIFI;
+  } else {
+    configServer.send(400, "text/plain", "Missing required fields");
+  }
+}
+
+// ---------- WiFi Connection ----------
+bool connectWiFi() {
   Serial.println("Connecting to WiFi...");
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.printf("  SSID: %s\n", savedSSID.c_str());
+  
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(savedSSID.c_str(), savedPassword.c_str());
   
   int attempts = 0;
   while (WiFi.status() != WL_CONNECTED && attempts < 20) {
@@ -115,28 +218,64 @@ void initWiFi() {
   }
   
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nWiFi connected!");
-    Serial.print("IP Address: ");
+    Serial.println("\n✓ WiFi connected!");
+    Serial.print("  IP Address: ");
     Serial.println(WiFi.localIP());
+    return true;
   } else {
-    Serial.println("\nFailed to connect to WiFi");
+    Serial.println("\n✗ Failed to connect to WiFi");
+    return false;
   }
+}
 
-#elif WIFI_MODE == 1
-  // ESP32 acts as Access Point
-  Serial.println("Starting WiFi Access Point...");
+// ---------- Server Connection Test ----------
+bool testServerConnection() {
+  Serial.println("Testing server connection...");
+  Serial.printf("  URL: %s\n", savedServerUrl.c_str());
+  
+  HTTPClient http;
+  http.begin(savedServerUrl + "/");
+  http.setTimeout(5000);
+  int httpCode = http.GET();
+  http.end();
+  
+  if (httpCode == 200) {
+    Serial.println("✓ Server is reachable!");
+    return true;
+  } else {
+    Serial.printf("✗ Server not reachable (HTTP %d)\n", httpCode);
+    return false;
+  }
+}
+
+// ---------- Clear Saved Credentials ----------
+void clearCredentials() {
+  Serial.println("Clearing saved credentials...");
+  preferences.clear();
+  savedSSID = "";
+  savedPassword = "";
+  savedServerUrl = "";
+}
+
+// ---------- Start Configuration Mode ----------
+void startConfigMode() {
+  Serial.println("\n========================================");
+  Serial.println("Starting WiFi Configuration Mode");
+  Serial.println("========================================");
+  
   WiFi.mode(WIFI_AP);
   WiFi.softAPConfig(local_IP, local_IP, IPAddress(255, 255, 255, 0));
-  WiFi.softAP(AP_SSID);  // Open AP (no password)
+  WiFi.softAP(AP_SSID);
   
-  Serial.println("Access Point started!");
-  Serial.print("SSID: ");
-  Serial.println(AP_SSID);
-  Serial.print("AP IP Address: ");
-  Serial.println(WiFi.softAPIP());
-  Serial.println("\nConnect your computer to this WiFi network,");
-  Serial.println("then update SERVER_URL with your computer's IP (192.168.4.x)");
-#endif
+  Serial.printf("Connect to WiFi: %s\n", AP_SSID);
+  Serial.printf("Then open: http://%s\n", WiFi.softAPIP().toString().c_str());
+  
+  // Setup web server routes
+  configServer.on("/", handleConfigRoot);
+  configServer.on("/save", HTTP_POST, handleConfigSave);
+  configServer.begin();
+  
+  Serial.println("Web server started. Waiting for configuration...");
 }
 
 // ---------- Send Status Update ----------
@@ -175,13 +314,35 @@ void setup() {
   Serial.println("HTTP Client Edition (Posts to Python Server)");
   Serial.println("==============================================");
 
-  // Build endpoint URLs
-  fullServerUrl = String(SERVER_URL) + String(SERVER_ENDPOINT);
-  statusUrl = String(SERVER_URL) + "/status_update";
-  completeUrl = String(SERVER_URL) + "/collection_complete";
+  // Initialize Preferences
+  preferences.begin("ppg-config", false);
   
-  Serial.print("Server URL: ");
-  Serial.println(SERVER_URL);
+  // Check for reset button held during boot
+  pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
+  delay(100);  // Debounce
+  if (digitalRead(RESET_BUTTON_PIN) == LOW) {
+    Serial.println("\n*** BOOT button held - Clearing saved credentials ***");
+    clearCredentials();
+    delay(1000);
+  }
+  
+  // Load saved credentials
+  savedSSID = preferences.getString("ssid", "");
+  savedPassword = preferences.getString("password", "");
+  savedServerUrl = preferences.getString("serverUrl", "");
+  
+  Serial.println("\nChecking saved configuration...");
+  Serial.printf("  SSID: %s\n", savedSSID.length() > 0 ? savedSSID.c_str() : "(not set)");
+  Serial.printf("  Server: %s\n", savedServerUrl.length() > 0 ? savedServerUrl.c_str() : "(not set)");
+  
+  // Determine initial state based on saved credentials
+  if (savedSSID.length() == 0 || savedPassword.length() == 0 || savedServerUrl.length() == 0) {
+    Serial.println("\nNo complete configuration found.");
+    currentState = CONFIGURE_WIFI;
+  } else {
+    Serial.println("\nConfiguration found. Will attempt connection.");
+    currentState = CONNECTING_WIFI;
+  }
 
   // Initialize I2C
   Wire.begin(I2C_SDA, I2C_SCL);
@@ -195,10 +356,9 @@ void setup() {
   Serial.println("MAX30102 initialized");
 
   // Configure MAX30102
-  // sampleRate=400, sampleAverage=8 → 50 Hz effective output
   byte ledBrightness = 0x1F;
   byte sampleAverage = 8;
-  byte ledMode = 2;        // Red + IR mode
+  byte ledMode = 2;
   int sampleRate = 400;
   int pulseWidth = 411;
   int adcRange = 16384;
@@ -208,23 +368,7 @@ void setup() {
   particleSensor.setPulseAmplitudeIR(0x1F);
   particleSensor.clearFIFO();
 
-  // Initialize WiFi
-  initWiFi();
-
-  // Test server availability
-  delay(2000);
-  HTTPClient http;
-  http.begin(String(SERVER_URL) + "/");
-  http.setTimeout(5000);
-  int httpCode = http.GET();
-  if (httpCode == 200) {
-    Serial.println("✓ Server is reachable!");
-  } else {
-    Serial.println("⚠ Server not reachable. Will retry during operation.");
-  }
-  http.end();
-
-  // Create esp_timer for precise sampling (50 Hz = 20 ms = 20,000 µs)
+  // Create esp_timer for precise sampling
   const esp_timer_create_args_t timer_args = {
     .callback = &onSampleTimer,
     .arg = NULL,
@@ -238,13 +382,20 @@ void setup() {
     Serial.println("Timer created (50 Hz, starts on finger detect)");
   }
 
-  Serial.println("\n✓ Ready! Place finger on sensor to begin.");
-  Serial.println("State: IDLE → WAITING_FOR_FINGER");
+  Serial.println("\nSetup complete.");
 }
 
 // ---------- MAIN LOOP ----------
 void loop() {
   switch (currentState) {
+    case CONFIGURE_WIFI:
+      handleConfigureWiFi();
+      break;
+
+    case CONNECTING_WIFI:
+      handleConnectingWiFi();
+      break;
+
     case IDLE:
       // Auto-transition to waiting for finger
       currentState = WAITING_FOR_FINGER;
@@ -270,6 +421,63 @@ void loop() {
       sendStatus("READY");
       break;
   }
+}
+
+// ---------- STATE: Configure WiFi (AP Mode) ----------
+void handleConfigureWiFi() {
+  static bool apStarted = false;
+  
+  if (!apStarted) {
+    startConfigMode();
+    apStarted = true;
+  }
+  
+  // Handle web server requests
+  configServer.handleClient();
+  
+  // Check if we transitioned out of config mode
+  if (currentState != CONFIGURE_WIFI) {
+    apStarted = false;
+  }
+  
+  delay(10);
+}
+
+// ---------- STATE: Connecting to WiFi ----------
+void handleConnectingWiFi() {
+  // Build endpoint URLs from saved server URL
+  fullServerUrl = savedServerUrl + String(SERVER_ENDPOINT);
+  statusUrl = savedServerUrl + "/status_update";
+  completeUrl = savedServerUrl + "/collection_complete";
+  
+  Serial.println("\n========================================");
+  Serial.println("Connecting to Network");
+  Serial.println("========================================");
+  
+  // Attempt WiFi connection
+  if (!connectWiFi()) {
+    Serial.println("WiFi connection failed. Returning to configuration mode.");
+    clearCredentials();
+    currentState = CONFIGURE_WIFI;
+    return;
+  }
+  
+  // Test server connection
+  delay(1000);
+  if (!testServerConnection()) {
+    Serial.println("Server connection failed. Returning to configuration mode.");
+    clearCredentials();
+    currentState = CONFIGURE_WIFI;
+    return;
+  }
+  
+  // Success! Transition to normal operation
+  Serial.println("\n========================================");
+  Serial.println("✓ Connected! Ready for operation.");
+  Serial.println("========================================");
+  Serial.println("Place finger on sensor to begin.");
+  
+  currentState = IDLE;
 }
 
 // ---------- STATE: Waiting for Finger ----------
@@ -329,9 +537,12 @@ void handleCollecting() {
     if (irValue < MIN_IR_THRESHOLD || irValue > MAX_IR_THRESHOLD) {
       poorQualitySamples++;
       Serial.printf("Poor quality sample detected: IR=%u\n", irValue);
-      currentState = IDLE;
+      if (sampleTimer) {
+        esp_timer_stop(sampleTimer);
+      }
       sendStatus("Restarting due to poor quality");
-      break;
+      currentState = IDLE;
+      return;
     }
     
     // Store sample (downscale from 18-bit to 16-bit by dividing by 4)
