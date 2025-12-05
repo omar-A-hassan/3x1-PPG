@@ -9,3 +9,13 @@ training/*
 scripts/_nohup
 .rsync-filter
 *.pdf
+
+# Environment files with credentials
+.env
+**/.env
+
+# Database dumps (may contain user data)
+*.sql
+
+# PPG health data (sensitive)
+ppg_data/

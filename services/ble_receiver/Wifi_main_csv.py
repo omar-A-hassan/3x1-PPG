@@ -36,6 +36,7 @@ ENABLE_DOWNLOAD_ENDPOINTS = False  # Disable download endpoints for cloud
 ESP32_DEVICE_NAME = "ESP32-PPG-Glucose"
 PREPROCESSING_SERVICE_URL = os.getenv("PREPROCESSING_SERVICE_URL", "http://localhost:8001")
 UI_SERVICE_URL = os.getenv("UI_SERVICE_URL", "http://localhost:8003")
+AUTH_SERVICE_URL = os.getenv("AUTH_SERVICE_URL", "http://localhost:8004")
 TOTAL_SAMPLES = 3000  # 60 seconds × 50 Hz sampling
 
 # Data storage configuration (only used if ENABLE_CSV_SAVE=True)
@@ -108,6 +109,34 @@ class CollectionStatus(BaseModel):
     last_saved_file: str | None = None
 
 
+# ============================================================================
+# API KEY VALIDATION
+# ============================================================================
+async def validate_api_key(api_key: str) -> bool:
+    """Validate API key against auth service."""
+    if not api_key:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.post(
+                f"{AUTH_SERVICE_URL}/validate-api-key",
+                json={"api_key": api_key}
+            )
+            return response.status_code == 200
+    except Exception as e:
+        logger.error(f"API key validation error: {e}")
+        return False
+
+
+async def require_api_key(request: Request):
+    """Extract and validate API key from request headers. Raises HTTPException if invalid."""
+    api_key = request.headers.get("X-API-Key", "")
+    if not await validate_api_key(api_key):
+        logger.warning(f"Invalid API key attempt: {api_key[:5]}..." if api_key else "No API key provided")
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+    return api_key
+
+
 @app.on_event("startup")
 async def _startup():
     """Startup: capture event loop."""
@@ -145,6 +174,9 @@ async def receive_chunk(request: Request):
     Triggers processing when all samples are received.
     """
     global ppg_buffer, collection_status, save_triggered
+    
+    # Validate API key
+    await require_api_key(request)
     
     try:
         # Get metadata from headers
@@ -215,6 +247,9 @@ async def collection_complete(request: Request):
     """
     global save_triggered
     
+    # Validate API key
+    await require_api_key(request)
+    
     try:
         data = await request.json()
         
@@ -247,6 +282,9 @@ async def collection_complete(request: Request):
 async def status_update(request: Request):
     """Receive status updates from ESP32 (optional, for monitoring)."""
     global collection_status
+    
+    # Validate API key
+    await require_api_key(request)
     
     try:
         data = await request.json()

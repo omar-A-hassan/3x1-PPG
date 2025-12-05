@@ -1,6 +1,6 @@
 # Optimized PPG Service Launcher
 # Starts all services in correct dependency order with health checks
-# Version 2.0 - Tested and Working
+# Version 3.0 - With Authentication Service
 
 param(
     [switch]$SkipNgrok = $true
@@ -10,8 +10,31 @@ $ErrorActionPreference = "Continue"
 $projectPath = "C:\Users\nazeh\BioInfo Trials\3x1-PPG\Dev\3x1-PPG"
 
 Write-Host "========================================" -ForegroundColor Cyan
-Write-Host "  PPG Monitoring System Launcher v2.0  " -ForegroundColor Cyan
+Write-Host "  PPG Monitoring System Launcher v3.0  " -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
+Write-Host ""
+
+# =============================================================================
+# PRE-FLIGHT CHECKS
+# =============================================================================
+
+Write-Host "Pre-flight checks..." -ForegroundColor Yellow
+
+# Check if MySQL is running (optional - skip auth service if not available)
+Write-Host "  Checking MySQL service..." -ForegroundColor Yellow -NoNewline
+$mysqlService = Get-Service -Name "MySQL*" -ErrorAction SilentlyContinue
+$skipAuth = $false
+if ($mysqlService -and $mysqlService.Status -eq "Running") {
+    Write-Host " Running [OK]" -ForegroundColor Green
+} else {
+    Write-Host " NOT FOUND" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "  MySQL not installed or not running." -ForegroundColor Yellow
+    Write-Host "  Auth service will be SKIPPED - using mock mode in UI." -ForegroundColor Yellow
+    Write-Host ""
+    $skipAuth = $true
+}
+
 Write-Host ""
 
 # Function to check if port is in use
@@ -55,7 +78,7 @@ function Wait-ForServiceReady {
 
 # Clean up existing services
 Write-Host "Checking for existing services..." -ForegroundColor Yellow
-$portsToClean = @(8000, 8001, 8002, 8003)
+$portsToClean = @(8000, 8001, 8003, 8004)
 $cleaned = $false
 
 foreach ($port in $portsToClean) {
@@ -83,28 +106,33 @@ Write-Host ""
 Write-Host "Starting services in dependency order..." -ForegroundColor Cyan
 Write-Host ""
 
-# 1. MODEL SERVICE (No dependencies - takes longest to start)
-Write-Host "[1/4] Starting Model Service..." -ForegroundColor Yellow
-Start-Process powershell -ArgumentList `
-    "-NoExit", `
-    "-Command", `
-    "cd '$projectPath'; `
-    Write-Host '========================================' -ForegroundColor Yellow; `
-    Write-Host '  MODEL SERVICE (Port 8002)            ' -ForegroundColor Yellow; `
-    Write-Host '========================================' -ForegroundColor Yellow; `
-    Write-Host ''; `
-    python -m uvicorn services.model.main:app --host 0.0.0.0 --port 8002 --reload --workers 1"
+# 1. AUTH SERVICE (Only if MySQL is available)
+if (-not $skipAuth) {
+    Write-Host "[1/4] Starting Auth Service..." -ForegroundColor Yellow
+    Start-Process powershell -ArgumentList `
+        "-NoExit", `
+        "-Command", `
+        "cd '$projectPath\services\auth_service'; `
+        Write-Host '========================================' -ForegroundColor Blue; `
+        Write-Host '  AUTH SERVICE (Port 8004)             ' -ForegroundColor Blue; `
+        Write-Host '========================================' -ForegroundColor Blue; `
+        Write-Host ''; `
+        python auth_service.py"
 
-if (-not (Wait-ForServiceReady -Port 8002 -ServiceName "Model" -TimeoutSeconds 30)) {
+    if (-not (Wait-ForServiceReady -Port 8004 -ServiceName "Auth" -TimeoutSeconds 20)) {
+        Write-Host ""
+        Write-Host "WARNING: Auth service failed to start!" -ForegroundColor Yellow
+        Write-Host "Continuing without auth - UI will use mock mode." -ForegroundColor Yellow
+        $skipAuth = $true
+    }
     Write-Host ""
-    Write-Host "ERROR: Model service failed to start!" -ForegroundColor Red
-    Write-Host "Check the Model service window for errors." -ForegroundColor Yellow
-    pause
-    exit 1
+} else {
+    Write-Host "[1/4] Skipping Auth Service (MySQL not available)..." -ForegroundColor Yellow
+    Write-Host "  UI will use MOCK_AUTH_SERVICE mode" -ForegroundColor Gray
+    Write-Host ""
 }
-Write-Host ""
 
-# 2. PREPROCESSING SERVICE (Depends on Model)
+# 2. PREPROCESSING SERVICE (No dependencies)
 Write-Host "[2/4] Starting Preprocessing Service..." -ForegroundColor Yellow
 Start-Process powershell -ArgumentList `
     "-NoExit", `
@@ -146,7 +174,7 @@ if (-not (Wait-ForServiceReady -Port 8000 -ServiceName "Receiver" -TimeoutSecond
 }
 Write-Host ""
 
-# 4. UI SERVICE (Depends on Receiver & Preprocessing)
+# 4. UI SERVICE (Depends on Receiver, Preprocessing & Auth)
 Write-Host "[4/4] Starting UI Service..." -ForegroundColor Yellow
 Start-Process powershell -ArgumentList `
     "-NoExit", `
@@ -177,7 +205,11 @@ Write-Host "========================================" -ForegroundColor Green
 Write-Host ""
 
 Write-Host "Service Status:" -ForegroundColor Cyan
-Write-Host "  [OK] Model Service:         http://localhost:8002" -ForegroundColor White
+if (-not $skipAuth) {
+    Write-Host "  [OK] Auth Service:          http://localhost:8004" -ForegroundColor White
+} else {
+    Write-Host "  [--] Auth Service:          SKIPPED (using mock mode)" -ForegroundColor Gray
+}
 Write-Host "  [OK] Preprocessing Service: http://localhost:8001" -ForegroundColor White
 Write-Host "  [OK] Receiver Service:      http://localhost:8000" -ForegroundColor White
 Write-Host "  [OK] UI Service (Gradio):   http://localhost:8003" -ForegroundColor Green
@@ -234,9 +266,9 @@ Write-Host "========================================" -ForegroundColor White
 Write-Host ""
 Write-Host "Next Steps:" -ForegroundColor Cyan
 Write-Host "  1. Check Gradio UI opened in browser" -ForegroundColor White
-Write-Host "  2. Connect ESP32 WiFi (ESP32-PPG-Glucose)" -ForegroundColor White
-Write-Host "  3. Click 'Start Collection' in UI" -ForegroundColor White
-Write-Host "  4. Place finger on sensor for 120 seconds" -ForegroundColor White
+Write-Host "  2. Login or Register in the Login tab" -ForegroundColor White
+Write-Host "  3. Copy your API key for ESP32" -ForegroundColor White
+Write-Host "  4. Connect ESP32 and place finger on sensor" -ForegroundColor White
 Write-Host ""
 Write-Host "To Stop Services:" -ForegroundColor Yellow
 Write-Host "  Close all PowerShell windows or run: .\stop.ps1" -ForegroundColor White

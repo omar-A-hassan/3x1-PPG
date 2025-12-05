@@ -58,6 +58,7 @@ Preferences preferences;
 String savedSSID = "";
 String savedPassword = "";
 String savedServerUrl = "";
+String savedApiKey = "";
 
 // HTTP endpoints (built from savedServerUrl)
 String fullServerUrl;
@@ -110,7 +111,7 @@ void handleConnectingWiFi();
 void handleWaitingForFinger();
 void handleCollecting();
 void handleTransmitting();
-void sendStatus(const char* statusMsg);
+int sendStatus(const char* statusMsg);
 bool connectWiFi();
 bool testServerConnection();
 void clearCredentials();
@@ -149,6 +150,10 @@ const char* configPageHtml = R"rawliteral(
       <input type="text" name="serverUrl" required placeholder="http://192.168.1.6:8000">
       <p class="note">For Cloud: https://your-service.run.app</p>
       
+      <label>API Key</label>
+      <input type="text" name="apiKey" required placeholder="Your API Key (e.g., XOZ35)">
+      <p class="note">Get your API key from the web interface after login</p>
+      
       <input type="submit" value="Save & Connect">
     </form>
   </div>
@@ -166,6 +171,7 @@ void handleConfigSave() {
     savedSSID = configServer.arg("ssid");
     savedPassword = configServer.arg("password");
     savedServerUrl = configServer.arg("serverUrl");
+    savedApiKey = configServer.arg("apiKey");
     
     // Remove trailing slash from server URL if present
     if (savedServerUrl.endsWith("/")) {
@@ -176,10 +182,12 @@ void handleConfigSave() {
     preferences.putString("ssid", savedSSID);
     preferences.putString("password", savedPassword);
     preferences.putString("serverUrl", savedServerUrl);
+    preferences.putString("apiKey", savedApiKey);
     
     Serial.println("Configuration saved:");
     Serial.printf("  SSID: %s\n", savedSSID.c_str());
     Serial.printf("  Server: %s\n", savedServerUrl.c_str());
+    Serial.printf("  API Key: %s\n", savedApiKey.c_str());
     
     // Send success response
     String response = "<html><body style='font-family:Arial;text-align:center;padding:50px;'>";
@@ -255,6 +263,7 @@ void clearCredentials() {
   savedSSID = "";
   savedPassword = "";
   savedServerUrl = "";
+  savedApiKey = "";
 }
 
 // ---------- Start Configuration Mode ----------
@@ -279,10 +288,11 @@ void startConfigMode() {
 }
 
 // ---------- Send Status Update ----------
-void sendStatus(const char* statusMsg) {
+int sendStatus(const char* statusMsg) {
   HTTPClient http;
   http.begin(statusUrl);
   http.addHeader("Content-Type", "application/json");
+  http.addHeader("X-API-Key", savedApiKey);
   http.setTimeout(5000);
   
   StaticJsonDocument<256> doc;
@@ -301,6 +311,7 @@ void sendStatus(const char* statusMsg) {
   }
   
   http.end();
+  return httpCode;
 }
 
 // ---------- SETUP ----------
@@ -328,15 +339,17 @@ void setup() {
   
   // Load saved credentials
   savedSSID = preferences.getString("ssid", "");
+  savedApiKey = preferences.getString("apiKey", "");
   savedPassword = preferences.getString("password", "");
   savedServerUrl = preferences.getString("serverUrl", "");
   
   Serial.println("\nChecking saved configuration...");
   Serial.printf("  SSID: %s\n", savedSSID.length() > 0 ? savedSSID.c_str() : "(not set)");
   Serial.printf("  Server: %s\n", savedServerUrl.length() > 0 ? savedServerUrl.c_str() : "(not set)");
+  Serial.printf("  API Key: %s\n", savedApiKey.length() > 0 ? savedApiKey.c_str() : "(not set)");
   
   // Determine initial state based on saved credentials
-  if (savedSSID.length() == 0 || savedPassword.length() == 0 || savedServerUrl.length() == 0) {
+  if (savedSSID.length() == 0 || savedPassword.length() == 0 || savedServerUrl.length() == 0 || savedApiKey.length() == 0) {
     Serial.println("\nNo complete configuration found.");
     currentState = CONFIGURE_WIFI;
   } else {
@@ -396,11 +409,22 @@ void loop() {
       handleConnectingWiFi();
       break;
 
-    case IDLE:
+    case IDLE: {
       // Auto-transition to waiting for finger
       currentState = WAITING_FOR_FINGER;
-      sendStatus("WAITING");
+      int statusCode = sendStatus("WAITING");
+      
+      // Check for authentication error (wrong API key)
+      if (statusCode == 401) {
+        Serial.println("\n*** Wrong API Key Entered ***");
+        Serial.println("Returning to configuration mode...");
+        // Clear only API key so user doesn't have to re-enter WiFi credentials
+        preferences.remove("apiKey");
+        savedApiKey = "";
+        currentState = CONFIGURE_WIFI;
+      }
       break;
+    }
 
     case WAITING_FOR_FINGER:
       handleWaitingForFinger();
@@ -634,6 +658,7 @@ void handleTransmitting() {
       http.addHeader("Content-Type", "application/octet-stream");
       http.addHeader("X-Chunk-Number", String(chunk));
       http.addHeader("X-Total-Chunks", String(totalChunks));
+      http.addHeader("X-API-Key", savedApiKey);
       http.setTimeout(15000);
       
       int httpCode = http.POST(packet, packetSize);
@@ -666,6 +691,7 @@ void handleTransmitting() {
   // Send collection_complete with metadata
   http.begin(completeUrl);
   http.addHeader("Content-Type", "application/json");
+  http.addHeader("X-API-Key", savedApiKey);
   
   StaticJsonDocument<256> doc;
   doc["samples_collected"] = samplesCollected;

@@ -30,7 +30,7 @@ app = FastAPI(title="UI Service")
 # DEBUG/DEPLOYMENT CONFIGURATION
 # ============================================================================
 ENABLE_CSV_FALLBACK = True  # Download CSV if raw_signal missing from response
-MOCK_AUTH_SERVICE = True    # Set to True to test login without auth service
+MOCK_AUTH_SERVICE = False    # Set to True to test login without auth service
 # ============================================================================
 
 # Service URLs (configurable via environment variables)
@@ -574,11 +574,11 @@ def create_gradio_interface():
                 )
                 data = resp.json()
                 
-                if resp.status_code == 200 and data.get("success"):
+                if resp.status_code == 200 and data.get("api_key"):
                     auth_state.login(username, data["api_key"])
                     return f"✅ Logged in as **{username}**", data["api_key"]
                 else:
-                    return f"❌ {data.get('error', 'Login failed')}", ""
+                    return f"❌ {data.get('detail', 'Login failed')}", ""
         except httpx.ConnectError:
             return "❌ Auth service not reachable", ""
         except Exception as e:
@@ -613,12 +613,12 @@ def create_gradio_interface():
                 )
                 data = resp.json()
                 
-                if resp.status_code == 200 and data.get("success"):
+                if resp.status_code == 200 and data.get("status") == "success":
                     new_key = data["new_api_key"]
                     auth_state.api_key = new_key
                     return f"✅ New API key generated", new_key
                 else:
-                    return f"❌ {data.get('error', 'Failed')}", auth_state.api_key or ""
+                    return f"❌ {data.get('detail', 'Failed')}", auth_state.api_key or ""
         except Exception as e:
             logger.error(f"Regenerate key error: {e}")
             return f"❌ Error: {e}", auth_state.api_key or ""
