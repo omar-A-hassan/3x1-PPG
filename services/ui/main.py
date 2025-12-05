@@ -623,6 +623,26 @@ def create_gradio_interface():
             logger.error(f"Regenerate key error: {e}")
             return f"❌ Error: {e}", auth_state.api_key or ""
 
+    def register_user(username: str, password: str):
+
+        if not username or not password:
+            return "❌ Please enter username and password"
+        
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                resp = client.post(
+                    f"{AUTH_SERVICE_URL}/register",
+                    json={"username": username, "password": password}
+                )
+                data = resp.json()
+                
+                if resp.status_code in [200,201] and data.get("status") == "success":
+                    return f"✅ Registration successful for **{username}**, Please Login to receive API Key"
+                else:
+                    return f"❌ {data.get('detail', 'Registration failed')}"
+                
+        except httpx.ConnectError:
+            return "❌ Auth service not reachable / Could not register successfully"
     # ========================================================================
     # GLUCOSE DISPLAY FUNCTIONS
     # ========================================================================
@@ -955,6 +975,23 @@ def create_gradio_interface():
                 inputs=[username_input, password_input],
                 outputs=[login_status, api_key_display]
             )
+        #Tab for registering new users, calls out the /register endpoint of auth service
+        with gr.Tab("➕ Register New User"):
+            gr.Markdown("## User Registration")
+            gr.Markdown("---")
+            gr.Markdown("This feature is not implemented in the UI at this time.")
+            
+            with gr.Row():
+                with gr.Column(scale=1):
+                    username_input_2 = gr.Textbox(label="Username", placeholder="Enter New username")
+                    password_input_2 = gr.Textbox(label="Password", type="password", placeholder="Enter New password")
+
+                    with gr.Row():
+                        register_btn = gr.Button("🆕 Register", variant="primary")
+
+            register_status = gr.Markdown("Please Enter Credentials to Register")
+            register_btn.click(fn=register_user,inputs=[username_input_2, password_input_2], outputs=[register_status])
+
         gr.Markdown("---")
         gr.Markdown("# 🩸 PPG-Based Glucose Monitor")
         gr.Markdown("")
