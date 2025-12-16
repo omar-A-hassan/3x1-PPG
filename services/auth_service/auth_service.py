@@ -42,7 +42,7 @@ DB_CONFIG = {
 
 def hash_password(password: str) -> str:
     """Returns the SHA256 hash of the input password."""
-    # Ensure the password is in bytes before hashing
+    print(f"DEBUG: Password received by hash_password: {password}")
     return hashlib.sha256(password.encode('utf-8')).hexdigest()
 
 
@@ -72,7 +72,7 @@ def execute_stored_procedure(procedure_name: str, args: tuple = ()) -> Optional[
             results.extend(result.fetchall())
 
         # 4. Commit (only necessary for procedures that modify data, like REGISTER or REGENERATE)
-        if procedure_name in ('sp_RegisterUser', 'sp_RegenerateApiKey'):
+        if procedure_name in ('sp_RegisterUser', 'sp_RegenerateApiKey', 'sp_LoginUser'):
             conn.commit()
 
         cursor.close()
@@ -151,27 +151,35 @@ def register_user(user: UserCredentials):
     return response
 
 
+
 # ------------------------------------------------------------------------------
-# 3. /login - Authenticates an existing user
+# 3. /login - Authenticates and generates a NEW API key
 # ------------------------------------------------------------------------------
 @app.post("/login", status_code=status.HTTP_200_OK)
 def login_user(user: UserCredentials):
     """
-    Authenticates a user. Hashes the password and calls sp_LoginUser.
+    Authenticates a user, generates a NEW API key, updates the database, 
+    and returns the new key for session use.
     """
     password_hash = hash_password(user.password)
+    
+    # 1. GENERATE THE NEW KEY HERE
+    new_api_key = generate_api_key() 
+    
+    # 2. EXECUTE SP with the NEW KEY as an argument
+    results = execute_stored_procedure(
+        "sp_LoginUser", 
+        (user.username, password_hash,new_api_key)
+    )
 
-    # Execute stored procedure: sp_LoginUser(@username, @password_hash)
-    results = execute_stored_procedure("sp_LoginUser", (user.username, password_hash))
-
-    if not results:
-        # sp_LoginUser returns no rows if credentials do not match
+    if not results or results[0].get("status") == "error":
+        # Handle "Invalid username or password" error returned by the SP
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid username or password."
+            detail=results[0].get("message", "Invalid username or password.")
         )
-
-    # Success: returns username and api_key
+    
+    # 3. SUCCESS: returns status, username, and the NEW api_key
     return results[0]
 
 

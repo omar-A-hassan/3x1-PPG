@@ -24,10 +24,16 @@
 #include <ArduinoJson.h>
 #include <WebServer.h>
 #include <Preferences.h>
+#include <LiquidCrystal_I2C.h>
 
 // ---------- CONFIGURATION ----------
 #define I2C_SDA 21
 #define I2C_SCL 22
+
+// ECG input and lead-off pins
+#define ECG_PIN 35       // ADC1_CH7 (ECG signal input)
+#define LO_PLUS_PIN 25   // Lead-off detection + (safe GPIO)
+#define LO_MINUS_PIN 26  // Lead-off detection - (safe GPIO)
 
 #define SAMPLING_RATE 50      // Target sampling rate in Hz
 #define TOTAL_SAMPLES 3000    // 60 seconds × 50 Hz = 3000 samples
@@ -49,6 +55,8 @@ const int WARMUP_MS = 3000;
 
 // ---------- GLOBALS ----------
 MAX30105 particleSensor;
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+bool serverConnected = false;
 
 // Web server for configuration
 WebServer configServer(80);
@@ -74,6 +82,7 @@ IPAddress local_IP(192, 168, 4, 1);
 
 // Data storage
 uint16_t ppgBuffer[TOTAL_SAMPLES];
+uint16_t ecgBuffer[TOTAL_SAMPLES];
 uint32_t sampleIndex = 0;
 
 // esp_timer for precise sampling
@@ -112,6 +121,7 @@ void handleWaitingForFinger();
 void handleCollecting();
 void handleTransmitting();
 int sendStatus(const char* statusMsg);
+void updateLcd(const char* statusMsg);
 bool connectWiFi();
 bool testServerConnection();
 void clearCredentials();
@@ -199,9 +209,12 @@ void handleConfigSave() {
     
     delay(2000);
     
-    // Stop AP and web server
+    // Properly stop AP mode before transitioning
+    Serial.println("Stopping AP mode...");
     configServer.stop();
     WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_OFF);  // Fully shutdown WiFi
+    delay(500);  // Allow WiFi stack to clean up
     
     // Transition to connecting state
     currentState = CONNECTING_WIFI;
@@ -215,7 +228,10 @@ bool connectWiFi() {
   Serial.println("Connecting to WiFi...");
   Serial.printf("  SSID: %s\n", savedSSID.c_str());
   
+  // Ensure WiFi is in correct mode with delay for stack initialization
   WiFi.mode(WIFI_STA);
+  delay(100);  // Allow mode switch to complete
+  
   WiFi.begin(savedSSID.c_str(), savedPassword.c_str());
   
   int attempts = 0;
@@ -311,7 +327,19 @@ int sendStatus(const char* statusMsg) {
   }
   
   http.end();
+  updateLcd(statusMsg);
   return httpCode;
+}
+
+void updateLcd(const char* statusMsg) {
+  const char* modeLabel = (currentState == CONFIGURE_WIFI) ? "M0" : "M1";
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(modeLabel);
+  lcd.print(" ");
+  lcd.print(serverConnected ? "ServerOn" : "ServerOff");
+  lcd.setCursor(0, 1);
+  lcd.print(statusMsg);
 }
 
 // ---------- SETUP ----------
@@ -356,6 +384,14 @@ void setup() {
     Serial.println("\nConfiguration found. Will attempt connection.");
     currentState = CONNECTING_WIFI;
   }
+
+  lcd.init();
+  lcd.backlight();
+  updateLcd(currentState == CONFIGURE_WIFI ? "CONFIG" : "CONNECTING");
+
+  // ECG lead-off inputs
+  pinMode(LO_PLUS_PIN, INPUT_PULLUP);
+  pinMode(LO_MINUS_PIN, INPUT_PULLUP);
 
   // Initialize I2C
   Wire.begin(I2C_SDA, I2C_SCL);
@@ -453,6 +489,7 @@ void handleConfigureWiFi() {
   
   if (!apStarted) {
     startConfigMode();
+    updateLcd("CONFIG");
     apStarted = true;
   }
   
@@ -477,10 +514,13 @@ void handleConnectingWiFi() {
   Serial.println("\n========================================");
   Serial.println("Connecting to Network");
   Serial.println("========================================");
+  updateLcd("CONNECTING");
   
   // Attempt WiFi connection
   if (!connectWiFi()) {
     Serial.println("WiFi connection failed. Returning to configuration mode.");
+    serverConnected = false;
+    updateLcd("RECONF");
     clearCredentials();
     currentState = CONFIGURE_WIFI;
     return;
@@ -490,10 +530,15 @@ void handleConnectingWiFi() {
   delay(1000);
   if (!testServerConnection()) {
     Serial.println("Server connection failed. Returning to configuration mode.");
+    serverConnected = false;
+    updateLcd("RECONF");
+    delay(1000);
     clearCredentials();
     currentState = CONFIGURE_WIFI;
     return;
   }
+  serverConnected = true;
+  updateLcd("READY");
   
   // Success! Transition to normal operation
   Serial.println("\n========================================");
@@ -556,6 +601,7 @@ void handleCollecting() {
     
     // Read sensor
     uint32_t irValue = particleSensor.getIR();
+    uint16_t ecgValue = analogRead(ECG_PIN);
     
     // Quality tracking
     if (irValue < MIN_IR_THRESHOLD || irValue > MAX_IR_THRESHOLD) {
@@ -571,6 +617,7 @@ void handleCollecting() {
     
     // Store sample (downscale from 18-bit to 16-bit by dividing by 4)
     ppgBuffer[sampleIndex] = (uint16_t)(irValue >> 2);
+    ecgBuffer[sampleIndex] = ecgValue;
     sampleIndex++;
     samplesCollected++;
     
@@ -630,62 +677,72 @@ void handleTransmitting() {
 
   HTTPClient http;
   
-  for (int chunk = 0; chunk < totalChunks; chunk++) {
-    int startIdx = chunk * SAMPLES_PER_CHUNK;
-    int endIdx = min(startIdx + SAMPLES_PER_CHUNK, (int)TOTAL_SAMPLES);
-    int chunkSamples = endIdx - startIdx;
+  auto sendStream = [&](uint16_t* buffer, const char* streamHeader) {
+    for (int chunk = 0; chunk < totalChunks; chunk++) {
+      int startIdx = chunk * SAMPLES_PER_CHUNK;
+      int endIdx = min(startIdx + SAMPLES_PER_CHUNK, (int)TOTAL_SAMPLES);
+      int chunkSamples = endIdx - startIdx;
 
-    // Build binary packet: 4-byte header + sample data
-    uint8_t packet[512];
-    
-    // Header (4 bytes)
-    packet[0] = chunk & 0xFF;           // Chunk number (low byte)
-    packet[1] = (chunk >> 8) & 0xFF;    // Chunk number (high byte)
-    packet[2] = (uint8_t)totalChunks;   // Total chunks
-    packet[3] = (uint8_t)chunkSamples;  // Samples in this chunk
+      uint8_t packet[512];
+      packet[0] = chunk & 0xFF;
+      packet[1] = (chunk >> 8) & 0xFF;
+      packet[2] = (uint8_t)totalChunks;
+      packet[3] = (uint8_t)chunkSamples;
 
-    // Copy samples (little-endian uint16_t)
-    memcpy(&packet[4], &ppgBuffer[startIdx], chunkSamples * sizeof(uint16_t));
+      memcpy(&packet[4], &buffer[startIdx], chunkSamples * sizeof(uint16_t));
 
-    int packetSize = 4 + (chunkSamples * sizeof(uint16_t));
+      int packetSize = 4 + (chunkSamples * sizeof(uint16_t));
 
-    // Send with retry logic
-    bool sent = false;
-    int retries = 3;
-    
-    for (int attempt = 0; attempt < retries && !sent; attempt++) {
-      http.begin(fullServerUrl);
-      http.addHeader("Content-Type", "application/octet-stream");
-      http.addHeader("X-Chunk-Number", String(chunk));
-      http.addHeader("X-Total-Chunks", String(totalChunks));
-      http.addHeader("X-API-Key", savedApiKey);
-      http.setTimeout(15000);
-      
-      int httpCode = http.POST(packet, packetSize);
-      
-      if (httpCode == 200) {
-        sent = true;
-        float progress = (float)(chunk + 1) / totalChunks * 100.0;
-        Serial.printf("Chunk %d/%d sent (%d samples, %.0f%%)\n",
-                      chunk + 1, totalChunks, chunkSamples, progress);
-      } else {
-        Serial.printf("Chunk %d failed (attempt %d): HTTP %d\n", 
-                      chunk + 1, attempt + 1, httpCode);
-        if (attempt < retries - 1) {
-          delay(1000);
+      bool sent = false;
+      int retries = 3;
+
+      for (int attempt = 0; attempt < retries && !sent; attempt++) {
+        http.begin(fullServerUrl);
+        http.addHeader("Content-Type", "application/octet-stream");
+        http.addHeader("X-Chunk-Number", String(chunk));
+        http.addHeader("X-Total-Chunks", String(totalChunks));
+        http.addHeader("X-API-Key", savedApiKey);
+        if (streamHeader && streamHeader[0] != '\0') {
+          http.addHeader("X-Stream-Type", streamHeader);
         }
+        http.setTimeout(15000);
+        
+        int httpCode = http.POST(packet, packetSize);
+        
+        if (httpCode == 200) {
+          sent = true;
+          float progress = (float)(chunk + 1) / totalChunks * 100.0;
+          Serial.printf("%s Chunk %d/%d sent (%d samples, %.0f%%)\n",
+                        streamHeader && streamHeader[0] ? streamHeader : "PPG",
+                        chunk + 1, totalChunks, chunkSamples, progress);
+        } else {
+          Serial.printf("%s Chunk %d failed (attempt %d): HTTP %d\n", 
+                        streamHeader && streamHeader[0] ? streamHeader : "PPG",
+                        chunk + 1, attempt + 1, httpCode);
+          if (attempt < retries - 1) {
+            delay(1000);
+          }
+        }
+        
+        http.end();
       }
       
-      http.end();
+      if (!sent) {
+        Serial.printf("ERROR: Failed to send %s chunk %d\n", streamHeader && streamHeader[0] ? streamHeader : "PPG", chunk + 1);
+        currentState = IDLE;
+        return false;
+      }
+      
+      delay(50);
     }
-    
-    if (!sent) {
-      Serial.printf("ERROR: Failed to send chunk %d\n", chunk + 1);
-      currentState = IDLE;
-      return;
-    }
-    
-    delay(50);  // Brief pause between chunks
+    return true;
+  };
+
+  if (!sendStream(ppgBuffer, "PPG")) {
+    return;
+  }
+  if (!sendStream(ecgBuffer, "ECG")) {
+    return;
   }
 
   // Send collection_complete with metadata
@@ -698,6 +755,9 @@ void handleTransmitting() {
   doc["duration_seconds"] = collection_metadata_duration;
   doc["actual_sample_rate"] = collection_metadata_rate;
   doc["poor_quality_count"] = poorQualitySamples;
+  doc["ecg_samples_collected"] = samplesCollected;
+  doc["ecg_sample_rate"] = SAMPLING_RATE;
+  doc["ecg_duration_seconds"] = collection_metadata_duration;
   
   String jsonStr;
   serializeJson(doc, jsonStr);

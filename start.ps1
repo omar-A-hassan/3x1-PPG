@@ -7,7 +7,8 @@ param(
 )
 
 $ErrorActionPreference = "Continue"
-$projectPath = "C:\Users\nazeh\BioInfo Trials\3x1-PPG\Dev\3x1-PPG"
+# Use the directory containing this script as the project root
+$projectPath = $PSScriptRoot
 
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host "  PPG Monitoring System Launcher v3.0  " -ForegroundColor Cyan
@@ -78,7 +79,7 @@ function Wait-ForServiceReady {
 
 # Clean up existing services
 Write-Host "Checking for existing services..." -ForegroundColor Yellow
-$portsToClean = @(8000, 8001, 8003, 8004)
+$portsToClean = @(8000, 8001, 8002, 8003, 8004)
 $cleaned = $false
 
 foreach ($port in $portsToClean) {
@@ -108,16 +109,16 @@ Write-Host ""
 
 # 1. AUTH SERVICE (Only if MySQL is available)
 if (-not $skipAuth) {
-    Write-Host "[1/4] Starting Auth Service..." -ForegroundColor Yellow
+    Write-Host "[1/5] Starting Auth Service..." -ForegroundColor Yellow
     Start-Process powershell -ArgumentList `
         "-NoExit", `
         "-Command", `
-        "cd '$projectPath\services\auth_service'; `
+        "cd '$projectPath'; `
         Write-Host '========================================' -ForegroundColor Blue; `
         Write-Host '  AUTH SERVICE (Port 8004)             ' -ForegroundColor Blue; `
         Write-Host '========================================' -ForegroundColor Blue; `
         Write-Host ''; `
-        python auth_service.py"
+        python -m uvicorn services.auth_service.auth_service:app --host 0.0.0.0 --port 8004 --reload"
 
     if (-not (Wait-ForServiceReady -Port 8004 -ServiceName "Auth" -TimeoutSeconds 20)) {
         Write-Host ""
@@ -127,13 +128,13 @@ if (-not $skipAuth) {
     }
     Write-Host ""
 } else {
-    Write-Host "[1/4] Skipping Auth Service (MySQL not available)..." -ForegroundColor Yellow
+    Write-Host "[1/5] Skipping Auth Service (MySQL not available)..." -ForegroundColor Yellow
     Write-Host "  UI will use MOCK_AUTH_SERVICE mode" -ForegroundColor Gray
     Write-Host ""
 }
 
 # 2. PREPROCESSING SERVICE (No dependencies)
-Write-Host "[2/4] Starting Preprocessing Service..." -ForegroundColor Yellow
+Write-Host "[2/5] Starting Preprocessing Service..." -ForegroundColor Yellow
 Start-Process powershell -ArgumentList `
     "-NoExit", `
     "-Command", `
@@ -153,8 +154,29 @@ if (-not (Wait-ForServiceReady -Port 8001 -ServiceName "Preprocessing" -TimeoutS
 }
 Write-Host ""
 
-# 3. RECEIVER SERVICE (Depends on Preprocessing)
-Write-Host "[3/4] Starting Receiver Service..." -ForegroundColor Yellow
+# 3. MODEL SERVICE (No dependencies - loads model at startup)
+Write-Host "[3/5] Starting Model Service..." -ForegroundColor Yellow
+Start-Process powershell -ArgumentList `
+    "-NoExit", `
+    "-Command", `
+    "cd '$projectPath'; `
+    Write-Host '========================================' -ForegroundColor DarkYellow; `
+    Write-Host '  MODEL SERVICE (Port 8002)            ' -ForegroundColor DarkYellow; `
+    Write-Host '========================================' -ForegroundColor DarkYellow; `
+    Write-Host ''; `
+    python -m uvicorn services.model.main:app --host 0.0.0.0 --port 8002 --reload"
+
+if (-not (Wait-ForServiceReady -Port 8002 -ServiceName "Model" -TimeoutSeconds 30)) {
+    Write-Host ""
+    Write-Host "ERROR: Model service failed to start!" -ForegroundColor Red
+    Write-Host "Check the Model service window for errors." -ForegroundColor Yellow
+    pause
+    exit 1
+}
+Write-Host ""
+
+# 4. RECEIVER SERVICE (Depends on Preprocessing & Model)
+Write-Host "[4/5] Starting Receiver Service..." -ForegroundColor Yellow
 Start-Process powershell -ArgumentList `
     "-NoExit", `
     "-Command", `
@@ -174,8 +196,8 @@ if (-not (Wait-ForServiceReady -Port 8000 -ServiceName "Receiver" -TimeoutSecond
 }
 Write-Host ""
 
-# 4. UI SERVICE (Depends on Receiver, Preprocessing & Auth)
-Write-Host "[4/4] Starting UI Service..." -ForegroundColor Yellow
+# 5. UI SERVICE (Depends on Receiver, Preprocessing, Model & Auth)
+Write-Host "[5/5] Starting UI Service..." -ForegroundColor Yellow
 Start-Process powershell -ArgumentList `
     "-NoExit", `
     "-Command", `
@@ -211,6 +233,7 @@ if (-not $skipAuth) {
     Write-Host "  [--] Auth Service:          SKIPPED (using mock mode)" -ForegroundColor Gray
 }
 Write-Host "  [OK] Preprocessing Service: http://localhost:8001" -ForegroundColor White
+Write-Host "  [OK] Model Service:         http://localhost:8002" -ForegroundColor White
 Write-Host "  [OK] Receiver Service:      http://localhost:8000" -ForegroundColor White
 Write-Host "  [OK] UI Service (Gradio):   http://localhost:8003" -ForegroundColor Green
 Write-Host ""
@@ -221,41 +244,61 @@ Start-Sleep -Seconds 2
 Start-Process "http://localhost:8003"
 Write-Host ""
 
-# Start ngrok if requested
+# Start Cloudflare tunnels if requested
 if (-not $SkipNgrok) {
     Write-Host "========================================" -ForegroundColor Cyan
-    Write-Host "  Mobile Access Setup                  " -ForegroundColor Cyan
+    Write-Host "  Remote Access Setup (Cloudflare)     " -ForegroundColor Cyan
     Write-Host "========================================" -ForegroundColor Cyan
     Write-Host ""
     
-    # Check if ngrok is available
-    $ngrokPath = $null
-    if (Test-Path "C:\ngrok\ngrok.exe") {
-        $ngrokPath = "C:\ngrok\ngrok.exe"
-    } elseif (Get-Command ngrok -ErrorAction SilentlyContinue) {
-        $ngrokPath = "ngrok"
+    # Check if cloudflared is available
+    $cloudflaredPath = $null
+    if (Get-Command cloudflared -ErrorAction SilentlyContinue) {
+        $cloudflaredPath = "cloudflared"
     }
     
-    if ($ngrokPath) {
-        Write-Host "Starting ngrok tunnel..." -ForegroundColor Yellow
+    if ($cloudflaredPath) {
+        Write-Host "Starting Cloudflare tunnels..." -ForegroundColor Yellow
         Write-Host ""
         
+        # Start UI Tunnel (port 8003)
+        Write-Host "  Starting UI tunnel (port 8003)..." -ForegroundColor Yellow
         Start-Process powershell -ArgumentList `
             "-NoExit", `
             "-Command", `
             "Write-Host '========================================' -ForegroundColor Cyan; `
-            Write-Host '  NGROK TUNNEL - Mobile Access         ' -ForegroundColor Cyan; `
+            Write-Host '  CLOUDFLARE TUNNEL - UI (Port 8003)   ' -ForegroundColor Cyan; `
             Write-Host '========================================' -ForegroundColor Cyan; `
             Write-Host ''; `
-            Write-Host 'Copy the HTTPS URL below and open on your phone:' -ForegroundColor Yellow; `
+            Write-Host 'Copy the URL below for mobile/remote access:' -ForegroundColor Yellow; `
             Write-Host ''; `
-            & '$ngrokPath' http 8003"
+            cloudflared tunnel --url http://localhost:8003"
         
-            Write-Host "  [OK] Ngrok tunnel starting in new window" -ForegroundColor Green
-        Write-Host "  Copy the https://...ngrok-free.dev URL for mobile access" -ForegroundColor Yellow
+        Write-Host "  Waiting 12 seconds before starting second tunnel..." -ForegroundColor Gray
+        Start-Sleep -Seconds 12
+        
+        # Start Receiver Tunnel (port 8000 - for ESP32)
+        Start-Process powershell -ArgumentList `
+            "-NoExit", `
+            "-Command", `
+            "Write-Host '========================================' -ForegroundColor Green; `
+            Write-Host '  CLOUDFLARE TUNNEL - ESP32 (Port 8000)' -ForegroundColor Green; `
+            Write-Host '========================================' -ForegroundColor Green; `
+            Write-Host ''; `
+            Write-Host 'Copy the URL below and configure in ESP32:' -ForegroundColor Yellow; `
+            Write-Host '(Format: https://your-url.trycloudflare.com)' -ForegroundColor Gray; `
+            Write-Host ''; `
+            cloudflared tunnel --url http://localhost:8000"
+        
+        Write-Host "  [OK] UI tunnel starting in new window" -ForegroundColor Green
+        Write-Host "  [OK] Receiver tunnel starting in new window" -ForegroundColor Green
+        Write-Host ""
+        Write-Host "  Copy the URLs from each tunnel window:" -ForegroundColor Yellow
+        Write-Host "    - UI tunnel: Use for mobile/remote access" -ForegroundColor White
+        Write-Host "    - Receiver tunnel: Configure in ESP32 settings" -ForegroundColor White
     } else {
-            Write-Host "  [!] Ngrok not found - skipping mobile access setup" -ForegroundColor Yellow
-        Write-Host "  Download from: https://ngrok.com/download" -ForegroundColor Gray
+        Write-Host "  [!] Cloudflared not found - skipping remote access setup" -ForegroundColor Yellow
+        Write-Host "  Install with: winget install cloudflare.cloudflared" -ForegroundColor Gray
     }
     Write-Host ""
 }
@@ -268,7 +311,15 @@ Write-Host "Next Steps:" -ForegroundColor Cyan
 Write-Host "  1. Check Gradio UI opened in browser" -ForegroundColor White
 Write-Host "  2. Login or Register in the Login tab" -ForegroundColor White
 Write-Host "  3. Copy your API key for ESP32" -ForegroundColor White
-Write-Host "  4. Connect ESP32 and place finger on sensor" -ForegroundColor White
+if (-not $SkipNgrok) {
+    Write-Host "  4. Copy tunnel URLs from the tunnel windows:" -ForegroundColor White
+    Write-Host "     - UI tunnel: For mobile/remote access" -ForegroundColor Gray
+    Write-Host "     - Receiver tunnel: Configure in ESP32" -ForegroundColor Gray
+    Write-Host "  5. Configure ESP32 with receiver tunnel URL + API key" -ForegroundColor White
+    Write-Host "  6. Connect ESP32 and place finger on sensor" -ForegroundColor White
+} else {
+    Write-Host "  4. Connect ESP32 and place finger on sensor" -ForegroundColor White
+}
 Write-Host ""
 Write-Host "To Stop Services:" -ForegroundColor Yellow
 Write-Host "  Close all PowerShell windows or run: .\stop.ps1" -ForegroundColor White

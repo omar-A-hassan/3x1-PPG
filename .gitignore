@@ -19,3 +19,6 @@ scripts/_nohup
 
 # PPG health data (sensitive)
 ppg_data/
+
+# Docker image exports
+all-images.tar

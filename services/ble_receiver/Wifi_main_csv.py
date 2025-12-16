@@ -47,6 +47,7 @@ if ENABLE_CSV_SAVE:
 # Global state
 save_triggered = False
 ppg_buffer = []
+ecg_buffer = []
 collection_status = "ESP32 Not Connected"
 main_event_loop: asyncio.AbstractEventLoop | None = None
 
@@ -65,6 +66,10 @@ collection_metadata = {
     # ESP32 precise timing (received via HTTP)
     "esp32_duration_seconds": None,
     "esp32_sample_rate": None,
+    # ECG metadata (optional)
+    "ecg_samples_collected": None,
+    "ecg_sample_rate": None,
+    "ecg_duration_seconds": None,
 }
 
 state_lock = threading.Lock()
@@ -173,7 +178,7 @@ async def receive_chunk(request: Request):
     Automatically resets buffer when Chunk 0 arrives.
     Triggers processing when all samples are received.
     """
-    global ppg_buffer, collection_status, save_triggered
+    global ppg_buffer, ecg_buffer, collection_status, collection_metadata, save_triggered
     
     # Validate API key
     await require_api_key(request)
@@ -182,11 +187,13 @@ async def receive_chunk(request: Request):
         # Get metadata from headers
         chunk_num = int(request.headers.get("X-Chunk-Number", 0))
         total_chunks = int(request.headers.get("X-Total-Chunks", 1))
+        stream_type = request.headers.get("X-Stream-Type", "PPG").upper().strip() or "PPG"
+        is_ecg = stream_type == "ECG"
         
         # Read binary data
         data = await request.body()
         
-        logger.info(f"[DEBUG] Received BINARY HTTP POST, length: {len(data)} bytes")
+        logger.info(f"[DEBUG] Received {stream_type} BINARY HTTP POST, length: {len(data)} bytes")
         
         if len(data) < 4:
             logger.error("Received binary message too short")
@@ -197,20 +204,23 @@ async def receive_chunk(request: Request):
         total_chunks_data = data[2]
         sample_count_data = data[3]
         
-        logger.info(f"[DEBUG] Chunk header: num={chunk_num_data}, total={total_chunks_data}, samples={sample_count_data}")
+        logger.info(f"[DEBUG] {stream_type} Chunk header: num={chunk_num_data}, total={total_chunks_data}, samples={sample_count_data}")
         
-        # AUTOMATIC RESET: If this is the first chunk, clear buffer and reset state
-        if chunk_num_data == 0:
+        # AUTOMATIC RESET: If this is the first chunk, clear buffer and reset state for this stream
+        if (chunk_num_data == 0):
             with state_lock:
-                logger.info("Received Chunk 0 - Auto-resetting buffer for new collection")
-                ppg_buffer = []
-                collection_status = "COLLECTING"
-                collection_metadata["start_time"] = datetime.now()
-                collection_metadata["end_time"] = None
-                collection_metadata["last_saved_file"] = None
-                collection_metadata["esp32_duration_seconds"] = None
-                collection_metadata["esp32_sample_rate"] = None
-                save_triggered = False
+                logger.info(f"Received {stream_type} Chunk 0 - Auto-resetting buffer for new collection")
+                if is_ecg:
+                    ecg_buffer = []
+                else:
+                    ppg_buffer = []
+                    collection_status = "COLLECTING"
+                    collection_metadata["start_time"] = datetime.now()
+                    collection_metadata["end_time"] = None
+                    collection_metadata["last_saved_file"] = None
+                    collection_metadata["esp32_duration_seconds"] = None
+                    collection_metadata["esp32_sample_rate"] = None
+                    save_triggered = False
         
         # Extract samples
         samples = []
@@ -222,16 +232,22 @@ async def receive_chunk(request: Request):
         
         # Add to buffer
         with state_lock:
-            ppg_buffer.extend(samples)
-            total_received = len(ppg_buffer)
+            target_buffer = ecg_buffer if is_ecg else ppg_buffer
+            target_buffer.extend(samples)
+            total_received = len(target_buffer)
+            if is_ecg:
+                ecg_buffer = target_buffer
+            else:
+                ppg_buffer = target_buffer
         
-        logger.info(f"Received chunk {chunk_num + 1}/{total_chunks}: {len(samples)} samples (total: {total_received})")
+        logger.info(f"Received {stream_type} chunk {chunk_num + 1}/{total_chunks}: {len(samples)} samples (total: {total_received})")
         
         return {
             "success": True,
             "chunk": chunk_num,
             "samples_received": len(samples),
-            "total_samples": total_received
+            "total_samples": total_received,
+            "stream": stream_type,
         }
         
     except Exception as e:
@@ -256,6 +272,9 @@ async def collection_complete(request: Request):
         # Store ESP32's precise timing metadata
         collection_metadata["esp32_duration_seconds"] = data.get("duration_seconds")
         collection_metadata["esp32_sample_rate"] = data.get("actual_sample_rate")
+        collection_metadata["ecg_samples_collected"] = data.get("ecg_samples_collected")
+        collection_metadata["ecg_sample_rate"] = data.get("ecg_sample_rate")
+        collection_metadata["ecg_duration_seconds"] = data.get("ecg_duration_seconds")
         collection_metadata["end_time"] = datetime.now()
         
         duration = data.get('duration_seconds', 0)
@@ -511,6 +530,13 @@ async def save_and_process_data():
                 glucose_value = glucose_json.get("glucose") if isinstance(glucose_json, dict) else None
                 model_device = glucose_json.get("model_device") if isinstance(glucose_json, dict) else None
 
+                # Prepare ECG signal (uses same timestamps as PPG since collected synchronously)
+                ecg_signal_list = None
+                with state_lock:
+                    if ecg_buffer and len(ecg_buffer) > 0:
+                        ecg_array = np.array(ecg_buffer[:len(ppg_signal)], dtype=np.float64)
+                        ecg_signal_list = ecg_array.tolist()
+
                 combined = {
                     "success": True,
                     # Glucose
@@ -529,6 +555,8 @@ async def save_and_process_data():
                     # Raw signal and timestamps for UI plotting
                     "raw_signal": ppg_signal.tolist(),
                     "timestamps_ms": timestamps_ms,
+                    # ECG signal (shares same timestamps as PPG)
+                    "ecg_signal": ecg_signal_list,
                     # Metadata
                     "device": model_device or "receiver",
                     "csv_file": csv_file_path,

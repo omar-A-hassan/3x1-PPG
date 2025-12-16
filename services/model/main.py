@@ -27,10 +27,17 @@ app = FastAPI(title="Model Service")
 # UI callback endpoint (env override for local runs)
 UI_SERVICE_URL = os.getenv("UI_SERVICE_URL", "http://localhost:8003")
 
-# In Docker, src and ts2vec are already in /app (copied by Dockerfile)
-# Add them to path for imports
-sys.path.insert(0, '/app')
-sys.path.insert(0, '/app/ts2vec')
+# Get the directory containing this script
+SCRIPT_DIR = Path(__file__).parent.absolute()
+
+# For localhost: Add src and ts2vec from services/model directory
+# For Docker: these paths are copied to /app
+if os.path.exists('/app'):  # Running in Docker
+    sys.path.insert(0, '/app')
+    sys.path.insert(0, '/app/ts2vec')
+else:  # Running on localhost
+    sys.path.insert(0, str(SCRIPT_DIR))  # Add services/model to path
+    sys.path.insert(0, str(SCRIPT_DIR / 'ts2vec'))  # Add services/model/ts2vec to path
 
 class PredictRequest(BaseModel):
     segments: List[List[float]]
@@ -181,7 +188,8 @@ model_inference = None
 async def startup_event():
     """Initialize model on startup"""
     global model_inference
-    model_path = Path("best_model.pt")  # Relative to /app in container
+    # Use path relative to script directory (works for both Docker and localhost)
+    model_path = SCRIPT_DIR / "best_model.pt"
 
     if not model_path.exists():
         logger.error(f"Model file not found: {model_path}")

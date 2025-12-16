@@ -29,7 +29,7 @@ app = FastAPI(title="UI Service")
 # ============================================================================
 # DEBUG/DEPLOYMENT CONFIGURATION
 # ============================================================================
-ENABLE_CSV_FALLBACK = True  # Download CSV if raw_signal missing from response
+ENABLE_CSV_FALLBACK = False  # Download CSV if raw_signal missing from response
 MOCK_AUTH_SERVICE = False    # Set to True to test login without auth service
 # ============================================================================
 
@@ -63,6 +63,8 @@ class UpdateResultRequest(BaseModel):
     # PSD arrays for respiratory plot
     freqs: Optional[List[float]] = None
     psd: Optional[List[float]] = None
+    # ECG data (parallel to PPG, uses same timestamps)
+    ecg_signal: Optional[List[float]] = None
 
 
 class ResultState:
@@ -92,6 +94,7 @@ class ResultState:
         timestamps_ms: Optional[List[float]] = None,
         freqs: Optional[List[float]] = None,
         psd: Optional[List[float]] = None,
+        ecg_signal: Optional[List[float]] = None,
     ) -> None:
         """Update result state with flexible keyword args.
 
@@ -125,6 +128,8 @@ class ResultState:
                 "timestamps_ms": keep("timestamps_ms", timestamps_ms),
                 "freqs": keep("freqs", freqs),
                 "psd": keep("psd", psd),
+                # ECG data (uses same timestamps as PPG)
+                "ecg_signal": keep("ecg_signal", ecg_signal),
             }
 
             self.latest_result = result
@@ -182,12 +187,20 @@ class AuthState:
 
 auth_state = AuthState()
 
+# endpoint that will return current user login status
+# if login status is not logged in, return Logged out as False
+@app.post("/login_status")
+async def login_status():
+    if auth_state.is_logged_in():
+        return {"status": "logged_in", "username": auth_state.username, "api_key": auth_state.api_key}
+    else:
+        return {"status": "logged_out"}
+
 @app.post("/update_result")
 async def update_result(request: UpdateResultRequest):
     """
-    Receiver service calls this after processing complete
-    Now includes csv_file path, optional respiratory metrics, and in-memory signal/PSD data
-    """
+    Receiver service calls this after processing complete (PPG and ECG)
+     to update latest glucose result and respiratory data."""
     try:
         result_state.update(
             glucose=request.glucose,
@@ -205,40 +218,8 @@ async def update_result(request: UpdateResultRequest):
             timestamps_ms=request.timestamps_ms,
             freqs=request.freqs,
             psd=request.psd,
+            ecg_signal=request.ecg_signal,
         )
-        # Best-effort: if a CSV path was provided but the UI can't access it locally,
-        # attempt to download it from the receiver service using the filename.
-        # Only try if download endpoints are likely enabled (check for file existence first)
-        if request.csv_file:
-            try:
-                csv_path = Path(request.csv_file)
-                if not csv_path.exists():
-                    # File doesn't exist locally - only attempt download if we suspect endpoints are enabled
-                    # To avoid 404 errors, we skip download if ENABLE_DOWNLOAD_ENDPOINTS is known to be False
-                    # For now, log the missing file but don't attempt download
-                    logger.info(f"CSV file not found locally: {csv_path}. Skipping download (receiver may have downloads disabled).")
-                    # If you enable receiver download endpoints, uncomment the code below:
-                    # filename = csv_path.name
-                    # download_url = f"{RECEIVER_SERVICE_URL}/download/{filename}"
-                    # logger.info(f"Attempting to download from receiver: {download_url}")
-                    # async with httpx.AsyncClient(timeout=30.0) as client:
-                    #     resp = await client.get(download_url)
-                    #     if resp.status_code == 200:
-                    #         PPG_DATA_DIR.mkdir(parents=True, exist_ok=True)
-                    #         dest = PPG_DATA_DIR / filename
-                    #         with open(dest, "wb") as f:
-                    #             f.write(resp.content)
-                    #         with result_state.lock:
-                    #             result_state.latest_csv_file = str(dest)
-                    #         logger.info(f"Downloaded CSV from receiver to {dest}")
-                    #     else:
-                    #         logger.warning(f"Failed to download CSV: {resp.status_code}")
-                else:
-                    # Path exists locally on UI host — store normalized path
-                    with result_state.lock:
-                        result_state.latest_csv_file = str(csv_path)
-            except Exception as e:
-                logger.warning(f"Error while checking CSV file for plotting: {e}")
         return {"status": "success"}
     except Exception as e:
         logger.error(f"Failed to update result: {e}")
@@ -432,34 +413,6 @@ def create_respiratory_psd_plot(freqs, psd, resp_freq_hz=None):
     return fig
 
 
-@safe_plot("Failed to generate overview plot")
-def create_overview_plot(timestamps, ir_values):
-    """Create overview plot of entire signal"""
-    fig = Figure(figsize=(12, 4))
-    ax = fig.add_subplot(111)
-    
-    ax.plot(timestamps, ir_values, linewidth=0.5, alpha=0.8, color='blue')
-    ax.set_xlabel('Time (seconds)', fontsize=11)
-    ax.set_ylabel('IR Value', fontsize=11)
-    
-    # Dynamic title based on actual duration
-    duration = timestamps[-1] - timestamps[0] if len(timestamps) > 0 else 0
-    ax.set_title(f'Complete PPG Signal ({duration:.0f} seconds)', fontsize=12, fontweight='bold')
-    ax.grid(True, alpha=0.3)
-    
-    # Add statistics box
-    stats_text = f"Samples: {len(ir_values)}\n"
-    stats_text += f"Mean: {ir_values.mean():.1f}\n"
-    stats_text += f"Std: {ir_values.std():.1f}\n"
-    stats_text += f"Range: [{ir_values.min():.0f}, {ir_values.max():.0f}]"
-    
-    ax.text(0.02, 0.98, stats_text, transform=ax.transAxes,
-           verticalalignment='top', fontsize=9,
-           bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.7))
-    
-    return fig
-
-
 async def compute_respiratory_rate(csv_path: Path):
     """Call preprocessing service to estimate respiratory rate from PPG data"""
     try:
@@ -521,7 +474,7 @@ def fetch_receiver_status() -> dict:
 def format_status_markdown(status_data: dict) -> str:
     """Format receiver status data as Markdown for display."""
     # Receiver returns "status", not "collection_status"
-    collection_status = status_data.get("status", "Unknown")
+    collection_status = status_data.get("status", "Unknown/ Disconnected")
     
     # Map status to emoji
     status_emoji = {
@@ -552,8 +505,11 @@ def create_gradio_interface():
     
     def handle_login(username: str, password: str):
         """Call auth service to login, or use mock mode for testing"""
-        if not username or not password:
-            return "❌ Please enter username and password", ""
+        try:
+            if not username or not password:
+                return "❌ Please enter username and password", "", gr.update(visible=True), gr.update(visible=False)
+        except httpx.ConnectError:
+            return "❌ Invalid input", "", gr.update(visible=True) , gr.update(visible=False)
         
         # MOCK MODE: For testing without auth service
         if MOCK_AUTH_SERVICE:
@@ -563,8 +519,9 @@ def create_gradio_interface():
             fake_key = ''.join(random.choices(string.ascii_uppercase, k=3)) + str(random.randint(10, 99))
             auth_state.login(username, fake_key)
             logger.info(f"[MOCK] Login successful for {username}, API key: {fake_key}")
-            return f"✅ Logged in as **{username}** (MOCK MODE)", fake_key
-        
+            return f"✅ Logged in as {username} (MOCK MODE)", fake_key, gr.update(visible=False)
+                    
+            
         # REAL MODE: Call auth service
         try:
             with httpx.Client(timeout=10.0) as client:
@@ -576,52 +533,19 @@ def create_gradio_interface():
                 
                 if resp.status_code == 200 and data.get("api_key"):
                     auth_state.login(username, data["api_key"])
-                    return f"✅ Logged in as **{username}**", data["api_key"]
+                    return f"✅ Logged in as {username}", data["api_key"], gr.update(visible=False), gr.update(visible=True)
                 else:
-                    return f"❌ {data.get('detail', 'Login failed')}", ""
+                    return f"❌ {data.get('detail', 'Login failed')}", "", gr.update(visible=True), gr.update(visible=False)
         except httpx.ConnectError:
-            return "❌ Auth service not reachable", ""
+            return "❌ Auth service not reachable", "", gr.update(visible=True), gr.update(visible=False)
         except Exception as e:
             logger.error(f"Login error: {e}")
-            return f"❌ Error: {e}", ""
+            return f"❌ Error: {e}", "", gr.update(visible=True), gr.update(visible=False)
 
     def handle_logout():
         """Clear login session"""
         auth_state.logout()
-        return "🔒 Logged out", ""
-
-    def handle_regenerate_key(username: str, password: str):
-        """Request new API key from auth service"""
-        if not auth_state.is_logged_in():
-            return "❌ Please login first", ""
-        
-        # MOCK MODE: Generate new fake key
-        if MOCK_AUTH_SERVICE:
-            import random
-            import string
-            new_key = ''.join(random.choices(string.ascii_uppercase, k=3)) + str(random.randint(10, 99))
-            auth_state.api_key = new_key
-            logger.info(f"[MOCK] Regenerated API key: {new_key}")
-            return f"✅ New API key generated (MOCK MODE)", new_key
-        
-        # REAL MODE: Call auth service
-        try:
-            with httpx.Client(timeout=10.0) as client:
-                resp = client.post(
-                    f"{AUTH_SERVICE_URL}/regenerate-api-key",
-                    json={"username": username, "password": password}
-                )
-                data = resp.json()
-                
-                if resp.status_code == 200 and data.get("status") == "success":
-                    new_key = data["new_api_key"]
-                    auth_state.api_key = new_key
-                    return f"✅ New API key generated", new_key
-                else:
-                    return f"❌ {data.get('detail', 'Failed')}", auth_state.api_key or ""
-        except Exception as e:
-            logger.error(f"Regenerate key error: {e}")
-            return f"❌ Error: {e}", auth_state.api_key or ""
+        return "🔒 Logged out", "", gr.update(visible=True), gr.update(visible=False)
 
     def register_user(username: str, password: str):
 
@@ -662,7 +586,7 @@ def create_gradio_interface():
                 "Waiting for data...",
                 "",
                 _get_history_text(),
-                create_placeholder_figure("No history to plot"),
+                create_placeholder_figure("No overview to plot"),
                 "No respiratory data yet"
             )
 
@@ -681,6 +605,18 @@ def create_gradio_interface():
 **Method:** {result.get('method_used', 'N/A')}
 """
         
+        # Build overview plot from latest signal if available (independent of glucose)
+        overview_fig = create_placeholder_figure("No overview to plot")
+        try:
+            timestamps, ir_values, source = get_signal_data()
+            if timestamps is not None and ir_values is not None and len(ir_values) > 1:
+                logger.info(f"Overview plot using {source}: {len(ir_values)} samples")
+                overview_fig = create_overview_plot(timestamps, ir_values)
+            else:
+                logger.warning("Overview plot skipped: no signal data available")
+        except Exception as e:
+            logger.error(f"Overview plot failed: {e}", exc_info=True)
+        
         if glucose is None:
             return (
                 status_markdown,
@@ -688,7 +624,7 @@ def create_gradio_interface():
                 "Waiting for model result...",
                 "",
                 _get_history_text(),
-                create_placeholder_figure("No history to plot"),
+                overview_fig,
                 resp_info
             )
         if glucose < 70:
@@ -715,12 +651,8 @@ def create_gradio_interface():
         ranges = """
 ### Reference Ranges:
 
-- **< 70 mg/dL:** Hypoglycemia (Low) 🔴
-- **70-140 mg/dL:** Normal 🟢
-- **141-200 mg/dL:** Elevated 🟡
-- **> 200 mg/dL:** Hyperglycemia (High) 🔴
 """
-        return (status_markdown, display, details, ranges, _get_history_text(), _get_history_plot(), resp_info)
+        return (status_markdown, display, details, ranges, _get_history_text(), overview_fig, resp_info)
 
     def _get_history_text():
         """Get history as markdown text"""
@@ -740,70 +672,84 @@ def create_gradio_interface():
             )
         return "\n".join(lines)
 
-    @safe_plot("Failed to generate history plot")
-    def _get_history_plot():
-        """Plot glucose history"""
-        history = result_state.get_history()
-        if len(history) < 2:
-            return create_placeholder_figure("Not enough history to plot")
-        
-        # Filter out None glucose values
-        valid_history = [(i, r['glucose']) for i, r in enumerate(history) if r.get('glucose') is not None]
-        
-        if len(valid_history) < 2:
-            return create_placeholder_figure("Not enough valid glucose readings to plot")
-        
-        indices, glucose_values = zip(*valid_history)
-        
-        fig = Figure(figsize=(10, 5))
+    @safe_plot("Failed to generate overview plot")
+    def create_overview_plot(timestamps, ir_values):
+        """Create overview plot of entire signal"""
+        fig = Figure(figsize=(12, 4))
         ax = fig.add_subplot(111)
         
-        ax.plot(indices, glucose_values, 'bo-', 
-               linewidth=2, markersize=8)
-        ax.axhline(y=70, color='r', linestyle='--', label='Low threshold')
-        ax.axhline(y=140, color='g', linestyle='--', label='Normal threshold')
-        ax.axhline(y=200, color='orange', linestyle='--', label='High threshold')
+        ax.plot(timestamps, ir_values, linewidth=0.5, alpha=0.8, color='blue')
+        ax.set_xlabel('Time (seconds)', fontsize=11)
+        ax.set_ylabel('IR Value', fontsize=11)
         
-        ax.set_xlabel('Measurement', fontsize=11)
-        ax.set_ylabel('Glucose (mg/dL)', fontsize=11)
-        ax.set_title('Glucose Level History', fontsize=12, fontweight='bold')
+        # Dynamic title based on actual duration
+        duration = timestamps[-1] - timestamps[0] if len(timestamps) > 0 else 0
+        ax.set_title(f'Complete PPG Signal ({duration:.0f} seconds)', fontsize=12, fontweight='bold')
         ax.grid(True, alpha=0.3)
-        ax.legend()
+        
+        # Add statistics box
+        stats_text = f"Samples: {len(ir_values)}\n"
+        stats_text += f"Mean: {ir_values.mean():.1f}\n"
+        stats_text += f"Std: {ir_values.std():.1f}\n"
+        stats_text += f"Range: [{ir_values.min():.0f}, {ir_values.max():.0f}]"
+        
+        ax.text(0.02, 0.98, stats_text, transform=ax.transAxes,
+            verticalalignment='top', fontsize=9,
+            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.7))
         
         return fig
 
-    def get_signal_data():
-        """Get signal data from in-memory result or CSV fallback.
+    def get_signal_data_by_type(signal_type="PPG"):
+        """Get signal data (PPG or ECG) from in-memory result or CSV fallback.
 
-        Returns: (timestamps[np.ndarray], ir_values[np.ndarray], data_source[str])
+        Args:
+            signal_type: "PPG" or "ECG"
+
+        Returns: (timestamps[np.ndarray], signal_values[np.ndarray], data_source[str])
                  or (None, None, None) if unavailable
         """
         result = result_state.get_latest()
-        if result and result.get("raw_signal") is not None and result.get("timestamps_ms") is not None:
-            ir_values = np.array(result["raw_signal"], dtype=float)
+        
+        # Determine field names based on signal type
+        # Note: Both PPG and ECG use the same timestamps (collected synchronously)
+        if signal_type == "ECG":
+            signal_field = "ecg_signal"
+            signal_label = "ECG"
+        else:  # Default to PPG
+            signal_field = "raw_signal"
+            signal_label = "PPG"
+        
+        # Both use timestamps_ms (shared timestamps)
+        if result and result.get(signal_field) is not None and result.get("timestamps_ms") is not None:
+            signal_values = np.array(result[signal_field], dtype=float)
             timestamps = np.array(result["timestamps_ms"], dtype=float) / 1000.0
-            logger.info("Using in-memory raw signal for plotting")
-            return timestamps, ir_values, "in-memory"
-        if ENABLE_CSV_FALLBACK:
+            logger.info(f"Using in-memory {signal_label} signal for plotting")
+            return timestamps, signal_values, f"in-memory {signal_label}"
+        
+        if ENABLE_CSV_FALLBACK and signal_type == "PPG":  # CSV fallback only for PPG
             csv_file = result_state.get_latest_csv()
             if csv_file and Path(csv_file).exists():
                 t, y = load_ppg_from_csv(Path(csv_file))
                 if t is not None and y is not None:
                     logger.info(f"Using CSV fallback for plotting: {csv_file}")
                     return np.asarray(t), np.asarray(y), f"CSV ({Path(csv_file).name})"
-        logger.warning("No signal data available for plotting")
+        
+        logger.warning(f"No {signal_label} signal data available for plotting")
         return None, None, None
+
+    def get_signal_data():
+        """Get PPG signal data (backward compatibility wrapper)"""
+        return get_signal_data_by_type("PPG")
 
     def generate_signal_plots():
         timestamps, ir_values, data_source = get_signal_data()
         
         # If no data available, return placeholders
         if timestamps is None or ir_values is None:
-            placeholders = [create_placeholder_figure("No data available")] * 9
+            placeholders = [create_placeholder_figure("No data available")] * 8
             return (*placeholders, "⚠️ No data available. Please complete a collection first.")
 
         # Create plots
-        overview = create_overview_plot(timestamps, ir_values)
         segments = create_segment_plots(timestamps, ir_values, segment_length=10.0)
 
         # Pad segments to 6 items with placeholder figures
@@ -821,9 +767,37 @@ def create_gradio_interface():
         status_msg = f"✅ Generated plots from {data_source} (fs≈{int(fs)} Hz)"
 
         # **Unpack segments list into individual outputs**
-        return (overview, *segments, spectrum, spectrogram, status_msg)
+        return (*segments, spectrum, spectrogram, status_msg)
 
-    def handle_respiratory_analysis(recompute: bool):
+    def generate_ecg_plots():
+        """Generate ECG signal plots (reuses existing plotting functions)"""
+        timestamps, ecg_values, data_source = get_signal_data_by_type("ECG")
+        
+        # If no data available, return placeholders
+        if timestamps is None or ecg_values is None:
+            placeholders = [create_placeholder_figure("No ECG data available")] * 8
+            return (*placeholders, "⚠️ No ECG data available. Please complete a collection first.")
+
+        # Create plots using same functions as PPG
+        segments = create_segment_plots(timestamps, ecg_values, segment_length=10.0)
+
+        # Pad segments to 6 items with placeholder figures
+        while len(segments) < 6:
+            segments.append(create_placeholder_figure("No segment data"))
+        segments = segments[:6]
+
+        # Estimate sampling rate
+        diffs = np.diff(timestamps)
+        fs = float(round(1.0 / np.median(diffs))) if len(diffs) > 0 and np.median(diffs) > 0 else 50.0
+
+        spectrum = create_spectrum_plot(ecg_values, fs=int(fs)) or create_placeholder_figure("No spectrum")
+        spectrogram = create_spectrogram_plot(ecg_values, fs=int(fs)) or create_placeholder_figure("No spectrogram")
+
+        status_msg = f"✅ Generated ECG plots from {data_source} (fs≈{int(fs)} Hz)"
+
+        return (*segments, spectrum, spectrogram, status_msg)
+
+    def handle_respiratory_analysis():
         """
         Unified respiratory analysis handler.
 
@@ -832,29 +806,29 @@ def create_gradio_interface():
 
         Returns: (status_markdown: str, psd_plot: Figure)
         """
-        if not recompute:
-            # Fast path: show in-memory PSD if available
-            result = result_state.get_latest()
-            if not result:
-                return ("⚠️ No results available", create_placeholder_figure("No data available"))
+        
+        # Fast path: show in-memory PSD if available
+        result = result_state.get_latest()
+        if not result:
+            return ("⚠️ No results available", create_placeholder_figure("No data available"))
 
-            freqs = result.get("freqs")
-            psd = result.get("psd")
-            resp_freq_hz = result.get("resp_freq_hz")
+        freqs = result.get("freqs")
+        psd = result.get("psd")
+        resp_freq_hz = result.get("resp_freq_hz")
 
-            if freqs is not None and psd is not None:
-                freqs_arr = np.array(freqs)
-                psd_arr = np.array(psd)
-                psd_plot = create_respiratory_psd_plot(freqs_arr, psd_arr, resp_freq_hz)
+        if freqs is not None and psd is not None:
+            freqs_arr = np.array(freqs)
+            psd_arr = np.array(psd)
+            psd_plot = create_respiratory_psd_plot(freqs_arr, psd_arr, resp_freq_hz)
 
-                resp_rate_bpm = result.get("resp_rate_bpm")
-                esqi = result.get("esqi")
-                entropy = result.get("entropy")
-                peaks_count = result.get("peaks_count")
-                method_used = result.get("method_used")
+            resp_rate_bpm = result.get("resp_rate_bpm")
+            esqi = result.get("esqi")
+            entropy = result.get("entropy")
+            peaks_count = result.get("peaks_count")
+            method_used = result.get("method_used")
 
-                if resp_rate_bpm is not None:
-                    status = f"""
+            if resp_rate_bpm is not None:
+                status = f"""
 ✅ **Respiratory Metrics (from latest result)**
 
 **Rate:** {resp_rate_bpm:.1f} breaths/min  
@@ -864,275 +838,313 @@ def create_gradio_interface():
 **Peaks:** {peaks_count}  
 **Method:** {method_used}
 """
-                else:
-                    status = "ℹ️ Respiratory data available (PSD plot shown)"
+            else:
+                status = "ℹ️ Respiratory data available (PSD plot shown)"
 
-                return (status, psd_plot)
+            return (status, psd_plot)
 
-            return ("⚠️ No respiratory analysis data available", create_placeholder_figure("No PSD data"))
+        return ("⚠️ No respiratory analysis data available", create_placeholder_figure("No PSD data"))
 
-        # Recompute path: call preprocessing service using latest CSV
-        csv_file = result_state.get_latest_csv()
-        if not csv_file or not Path(csv_file).exists():
-            return ("⚠️ No data file available", create_placeholder_figure("No data available"))
-
-        try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            resp_data = loop.run_until_complete(compute_respiratory_rate(Path(csv_file)))
-            loop.close()
-        except Exception as e:
-            logger.error(f"Error in respiratory computation: {e}", exc_info=True)
-            return (f"❌ Error: {e}", create_placeholder_figure("Computation failed"))
-
-        if resp_data is None or not resp_data.get("success"):
-            error_msg = resp_data.get("error", "Unknown error") if resp_data else "Request failed"
-            return (f"⚠️ Analysis failed: {error_msg}", create_placeholder_figure("Analysis failed"))
-
-        # Update result state with respiratory metrics (preserve other fields)
-        result = result_state.get_latest() or {}
-        result_state.update(
-            glucose=result.get("glucose"),
-            num_segments=result.get("num_segments", 0),
-            quality_score=result.get("quality_score", 0.0),
-            device=result.get("device", "Unknown"),
-            csv_file=csv_file,
-            resp_rate_bpm=resp_data.get("resp_rate_bpm"),
-            resp_freq_hz=resp_data.get("resp_freq_hz"),
-            esqi=resp_data.get("esqi"),
-            entropy=resp_data.get("entropy"),
-            peaks_count=resp_data.get("peaks_count"),
-            method_used=resp_data.get("method_used"),
-            raw_signal=result.get("raw_signal"),
-            timestamps_ms=result.get("timestamps_ms"),
-            freqs=resp_data.get("freqs"),
-            psd=resp_data.get("psd"),
-        )
-
-        # Build plot from recomputed PSD
-        freqs = resp_data.get("freqs", [])
-        psd = resp_data.get("psd", [])
-        resp_freq_hz = resp_data.get("resp_freq_hz")
-        psd_plot = (
-            create_respiratory_psd_plot(freqs, psd, resp_freq_hz)
-            if freqs and psd else create_placeholder_figure("No PSD data available")
-        )
-
-        status = f"""
-✅ **Respiratory Analysis Complete**
-
-**Rate:** {resp_data.get('resp_rate_bpm', 0):.1f} breaths/min  
-**Frequency:** {resp_data.get('resp_freq_hz', 0):.3f} Hz  
-**ESQI:** {resp_data.get('esqi', 0):.3f}  
-**Entropy:** {resp_data.get('entropy', 0):.3f}  
-**Peaks:** {resp_data.get('peaks_count', 0)}  
-**Method:** {resp_data.get('method_used', 'N/A')}
-"""
-
-        return (status, psd_plot)
 
     # ========================================================================
     # BUILD GRADIO INTERFACE
     # ========================================================================
     
     with gr.Blocks(title="PPG Glucose Monitor") as interface:
-        with gr.Tab("🔐 Login"):
-            gr.Markdown("## User Authentication")
-            gr.Markdown("Login to get your API key for ESP32 configuration")
-            
-            with gr.Row():
-                with gr.Column(scale=1):
-                    username_input = gr.Textbox(label="Username", placeholder="Enter username")
-                    password_input = gr.Textbox(label="Password", type="password", placeholder="Enter password")
-                    
-                    with gr.Row():
-                        login_btn = gr.Button("🔑 Login", variant="primary")
-                        logout_btn = gr.Button("🚪 Logout", variant="secondary")
-            
-            login_status = gr.Markdown("Not logged in")
-            
-            gr.Markdown("---")
-            gr.Markdown("## Your API Key")
-            gr.Markdown("*Copy this key to your ESP32 configuration*")
-            
-            api_key_display = gr.Textbox(label="API Key", value="", interactive=False)
-            regenerate_btn = gr.Button("🔄 Generate New Key")
-            
-            # Connect buttons to functions
-            login_btn.click(
-                fn=handle_login,
-                inputs=[username_input, password_input],
-                outputs=[login_status, api_key_display]
-            )
-            
-            logout_btn.click(
-                fn=handle_logout,
-                outputs=[login_status, api_key_display]
-            )
-            
-            regenerate_btn.click(
-                fn=handle_regenerate_key,
-                inputs=[username_input, password_input],
-                outputs=[login_status, api_key_display]
-            )
-        #Tab for registering new users, calls out the /register endpoint of auth service
-        with gr.Tab("➕ Register New User"):
-            gr.Markdown("## User Registration")
-            gr.Markdown("---")
-            gr.Markdown("This feature is not implemented in the UI at this time.")
-            
-            with gr.Row():
-                with gr.Column(scale=1):
-                    username_input_2 = gr.Textbox(label="Username", placeholder="Enter New username")
-                    password_input_2 = gr.Textbox(label="Password", type="password", placeholder="Enter New password")
-
-                    with gr.Row():
-                        register_btn = gr.Button("🆕 Register", variant="primary")
-
-            register_status = gr.Markdown("Please Enter Credentials to Register")
-            register_btn.click(fn=register_user,inputs=[username_input_2, password_input_2], outputs=[register_status])
-
+        # ====================================================================
         gr.Markdown("---")
         gr.Markdown("# 🩸 PPG-Based Glucose Monitor")
         gr.Markdown("")
+
+        # ====================================================================
+        login_panel = gr.Group(elem_id="login-box", elem_classes=["login-card"])
+        with login_panel:
+            with gr.Tab("🔐 Login"):
+                gr.Markdown("## User Authentication")
+                gr.Markdown("Login to get your API key for ESP32 configuration")
+                gr.Markdown("  \n")
+                
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        username_input = gr.Textbox(label="Username", placeholder="Enter username")
+                        password_input = gr.Textbox(label="Password", type="password", placeholder="Enter password")
+                    
+                
+                
+                
+            #Tab for registering new users, calls out the /register endpoint of auth service
+            with gr.Tab("➕ Register New User"):
+                gr.Markdown("## User Registration")
+                gr.Markdown("---")
+                gr.Markdown("This feature is not implemented in the UI at this time.")
+                
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        username_input_2 = gr.Textbox(label="Username", placeholder="Enter New username")
+                        password_input_2 = gr.Textbox(label="Password", type="password", placeholder="Enter New password")
+
+                        with gr.Row():
+                            register_btn = gr.Button("🆕 Register", variant="primary")
+
+                register_status = gr.Markdown("Please Enter Credentials to Register")
+                register_btn.click(fn=register_user,inputs=[username_input_2, password_input_2], outputs=[register_status])
         
+        with gr.Row():
+            with gr.Column(scale=1):
+                status_display = gr.Textbox(value="Not logged in", label="Login Status", interactive=False)
+            with gr.Column(scale=1):
+                api_key_display = gr.Textbox(label="API Key", value="", interactive=False)
+            with gr.Column(scale=1):
+                login_btn = gr.Button("🔑 Login", variant="primary", size="lg")
+                logout_btn = gr.Button("🔒 Logout", variant="secondary", size="lg")
+                
+
+
+
+        gr.Markdown("---")
         # ====================================================================
         # TAB 1: GLUCOSE MONITORING
         # ====================================================================
         
-        with gr.Tab("📊 Glucose Monitor"):
-            gr.Markdown("## Collection Status")
-            gr.Markdown("*ESP32 runs autonomously - place finger on sensor to start collection*")
+        data_panel = gr.Group(elem_id="Data-box", elem_classes=["login-card"],visible=False)
+        with data_panel:
             
-            with gr.Row():
-                status_box = gr.Markdown(value="**Status:** ⏸️ Refresh status...")
-                refresh_btn = gr.Button("🔄 Refresh Status", variant="primary", scale=1)
-
-            gr.Markdown("---")
-            gr.Markdown("## Current Prediction")
-            
-            with gr.Row():
-                with gr.Column(scale=1):
-                    glucose_output = gr.Markdown("### Waiting for data...")
-                    details_output = gr.Markdown("No prediction yet")
+            with gr.Tab("📊 Glucose Monitor"):
+                gr.Markdown("## Collection Status")
+                gr.Markdown("*ESP32 runs autonomously - place finger on sensor to start collection*")
+                gr.Markdown("___")
                 
-                with gr.Column(scale=1):
-                    ranges_output = gr.Markdown("")
-                    respiratory_output = gr.Markdown("**Respiratory Analysis:** Not yet computed")
+                with gr.Row():
+                    status_box = gr.Markdown(value="**Status:** ⏸️ Refresh status...")
+                    refresh_btn = gr.Button("🔄 Refresh Status", variant="primary", scale=1)
 
-            gr.Markdown("---")
-            gr.Markdown("## History")
-            
-            with gr.Row():
-                history_text = gr.Markdown("No history yet")
-
-            with gr.Row():
-                history_plot = gr.Plot(label="Glucose Trends")
-
-            # Button bindings
-            refresh_btn.click(
-                fn=get_current_result,
-                outputs=[status_box, glucose_output, details_output, ranges_output, history_text, history_plot, respiratory_output]
-            )
-        
-        # ====================================================================
-        # TAB 2: SIGNAL VISUALIZATION
-        # ====================================================================
-        
-        with gr.Tab("📈 Signal Analysis"):
-            gr.Markdown("## Raw PPG Signal Visualization")
-            gr.Markdown("View time-domain and frequency-domain analysis of collected data (60 seconds)")
-            
-            with gr.Row():
-                plot_btn = gr.Button("🔄 Generate Plots", variant="primary", size="lg")
-            
-            plot_status = gr.Markdown("Click 'Generate Plots' to visualize the latest collection")
-            
-            gr.Markdown("---")
-            gr.Markdown("### Complete Signal Overview")
-            overview_plot = gr.Plot(label="Full PPG Signal")
-            
-            gr.Markdown("---")
-            gr.Markdown("### Time-Domain Segments (10-second windows)")
-            
-            with gr.Row():
-                segment_plot_1 = gr.Plot(label="Segment 1")
-                segment_plot_2 = gr.Plot(label="Segment 2")
-            
-            with gr.Row():
-                segment_plot_3 = gr.Plot(label="Segment 3")
-                segment_plot_4 = gr.Plot(label="Segment 4")
-            
-            with gr.Row():
-                segment_plot_5 = gr.Plot(label="Segment 5")
-                segment_plot_6 = gr.Plot(label="Segment 6")
-            
-            gr.Markdown("---")
-            gr.Markdown("### Frequency-Domain Analysis")
-            
-            with gr.Row():
-                spectrum_plot = gr.Plot(label="Power Spectrum")
-            
-            with gr.Row():
-                spectrogram_plot = gr.Plot(label="Spectrogram")
-            
-            # Plot generation binding
-            plot_btn.click(
-            fn=generate_signal_plots,
-            outputs=[
-            overview_plot,
-            segment_plot_1,
-            segment_plot_2,
-            segment_plot_3,
-            segment_plot_4,
-            segment_plot_5,
-            segment_plot_6,
-            spectrum_plot,
-            spectrogram_plot,
-            plot_status
-            ]
-            )
-        
-        # ====================================================================
-        # TAB 3: RESPIRATORY ANALYSIS
-        # ====================================================================
-        
-        with gr.Tab("🫁 Respiratory Analysis"):
-            gr.Markdown("## Respiratory Rate Estimation from PPG")
-            gr.Markdown("Analyze inter-beat intervals using Welch's method to estimate respiratory rate")
-            
-            with gr.Row():
-                recompute_checkbox = gr.Checkbox(label="Recompute from CSV", value=False)
-                analyze_resp_btn = gr.Button("🔍 Analyze", variant="primary", size="lg")
-            
-            resp_status = gr.Markdown("Click 'Analyze' to show respiratory metrics (optionally recompute from CSV)")
-            
-            gr.Markdown("---")
-            gr.Markdown("### Respiratory PSD Analysis")
-            
-            respiratory_psd_plot = gr.Plot(label="Respiratory Power Spectral Density")
-            
-            # Unified respiratory analysis binding
-            analyze_resp_btn.click(
-                fn=handle_respiratory_analysis,
-                inputs=[recompute_checkbox],
-                outputs=[resp_status, respiratory_psd_plot]
-            )
-
-        # ====================================================================
-        # TAB 3: Blood Pressure Analysis
-        # ====================================================================
-
-        with gr.Tab("💢 Blood Pressure Monitor"):
-            gr.Markdown("## This feature is under development")
-            gr.Markdown("")
-
-            with gr.Row():
-                compute_bp_btn = gr.Button("🔎 Compute Blood Pressure", variant="primary", scale=1)
-
-            gr.Markdown("###")
-            gr.Markdown("---")
+                gr.Markdown("---")
+                gr.Markdown("## Current Prediction")
                 
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        glucose_output = gr.Markdown("### Waiting for data...")
+                        details_output = gr.Markdown("No prediction yet")
+                    
+                    with gr.Column(scale=1):
+                        ranges_output = gr.Markdown("")
+                        respiratory_output = gr.Markdown("**Respiratory Analysis:** Not yet computed")
+
+                gr.Markdown("---")
+                gr.Markdown("## Overview")
+                
+                with gr.Row():
+                    history_text = gr.Markdown("No history yet")
+
+                with gr.Row():
+                    history_plot = gr.Plot(label="PPG Overview")
+
+                # Button bindings
+                refresh_btn.click(
+                    fn=get_current_result,
+                    outputs=[status_box, glucose_output, details_output, ranges_output, history_text, history_plot, respiratory_output]
+                )
+            
+            # ====================================================================
+            # TAB 2: SIGNAL VISUALIZATION
+            # ====================================================================
+            
+            with gr.Tab("📈 Signal Analysis"):
+                gr.Markdown("## Raw PPG Signal Visualization")
+                gr.Markdown("View time-domain and frequency-domain analysis of collected data (60 seconds)")
+                
+                with gr.Row():
+                    plot_btn = gr.Button("🔄 Generate Plots", variant="primary", size="lg")
+                
+                plot_status = gr.Markdown("Click 'Generate Plots' to visualize the latest collection")
+                
+                gr.Markdown("---")
+                gr.Markdown("### Time-Domain Segments (10-second windows)")
+                
+                with gr.Row():
+                    segment_plot_1 = gr.Plot(label="Segment 1")
+                    segment_plot_2 = gr.Plot(label="Segment 2")
+                
+                with gr.Row():
+                    segment_plot_3 = gr.Plot(label="Segment 3")
+                    segment_plot_4 = gr.Plot(label="Segment 4")
+                
+                with gr.Row():
+                    segment_plot_5 = gr.Plot(label="Segment 5")
+                    segment_plot_6 = gr.Plot(label="Segment 6")
+                
+                gr.Markdown("---")
+                gr.Markdown("### Frequency-Domain Analysis")
+                
+                with gr.Row():
+                    spectrum_plot = gr.Plot(label="Power Spectrum")
+                
+                with gr.Row():
+                    spectrogram_plot = gr.Plot(label="Spectrogram")
+                
+                # Plot generation binding
+                plot_btn.click(
+                    fn=generate_signal_plots,
+                    outputs=[
+                        segment_plot_1,
+                        segment_plot_2,
+                        segment_plot_3,
+                        segment_plot_4,
+                        segment_plot_5,
+                        segment_plot_6,
+                        spectrum_plot,
+                        spectrogram_plot,
+                        plot_status,
+                    ],
+                )
+            
+            # ====================================================================
+            # TAB 3: RESPIRATORY ANALYSIS
+            # ====================================================================
+            
+            with gr.Tab("🫁 Respiratory Analysis"):
+                gr.Markdown("## Respiratory Rate Estimation from PPG")
+                gr.Markdown("Analyze inter-beat intervals using Welch's method to estimate respiratory rate")
+                
+                with gr.Row():
+                    analyze_resp_btn = gr.Button("🔍 Analyze", variant="primary", size="lg")
+                
+                resp_status = gr.Markdown("Click 'Analyze' to show respiratory metrics (optionally recompute from CSV)")
+                
+                gr.Markdown("---")
+                gr.Markdown("### Respiratory PSD Analysis")
+                
+                respiratory_psd_plot = gr.Plot(label="Respiratory Power Spectral Density")
+                
+                # Unified respiratory analysis binding
+                analyze_resp_btn.click(
+                    fn=handle_respiratory_analysis,
+                    inputs=[],
+                    outputs=[resp_status, respiratory_psd_plot]
+                )
+
+            # ====================================================================
+            # TAB 4: ECG ANALYSIS
+            # ====================================================================
+            
+            with gr.Tab("⚡ ECG Analysis"):
+                gr.Markdown("## ECG Signal Visualization")
+                gr.Markdown("View time-domain and frequency-domain analysis of collected ECG data (60 seconds)")
+                
+                with gr.Row():
+                    ecg_plot_btn = gr.Button("🔄 Generate ECG Plots", variant="primary", size="lg")
+                
+                ecg_plot_status = gr.Markdown("Click 'Generate ECG Plots' to visualize the latest collection")
+                
+                gr.Markdown("---")
+                gr.Markdown("### Time-Domain Segments (10-second windows)")
+                
+                with gr.Row():
+                    ecg_segment_plot_1 = gr.Plot(label="Segment 1")
+                    ecg_segment_plot_2 = gr.Plot(label="Segment 2")
+                
+                with gr.Row():
+                    ecg_segment_plot_3 = gr.Plot(label="Segment 3")
+                    ecg_segment_plot_4 = gr.Plot(label="Segment 4")
+                
+                with gr.Row():
+                    ecg_segment_plot_5 = gr.Plot(label="Segment 5")
+                    ecg_segment_plot_6 = gr.Plot(label="Segment 6")
+                
+                gr.Markdown("---")
+                gr.Markdown("### Frequency-Domain Analysis")
+                
+                with gr.Row():
+                    ecg_spectrum_plot = gr.Plot(label="Power Spectrum")
+                
+                with gr.Row():
+                    ecg_spectrogram_plot = gr.Plot(label="Spectrogram")
+                
+                # Plot generation binding
+                ecg_plot_btn.click(
+                    fn=generate_ecg_plots,
+                    outputs=[
+                        ecg_segment_plot_1,
+                        ecg_segment_plot_2,
+                        ecg_segment_plot_3,
+                        ecg_segment_plot_4,
+                        ecg_segment_plot_5,
+                        ecg_segment_plot_6,
+                        ecg_spectrum_plot,
+                        ecg_spectrogram_plot,
+                        ecg_plot_status,
+                    ],
+                )
+
+            # ====================================================================
+            # TAB 5: Blood Pressure Analysis
+            # ====================================================================
+
+            with gr.Tab("💢 Blood Pressure Monitor"):
+                gr.Markdown("## This feature is under development")
+                gr.Markdown("")
+
+                with gr.Row():
+                    compute_bp_btn = gr.Button("🔎 Compute Blood Pressure", variant="primary", scale=1)
+
+                gr.Markdown("###")
+                gr.Markdown("---")
+
+
+        # ====================================================================
+        # Connect buttons to functions using the global status_display
+
+        login_btn.click(
+            fn=handle_login,
+            inputs=[username_input, password_input],
+            outputs=[status_display, api_key_display, login_panel,data_panel]
+        )
+
+        logout_btn.click(
+            fn=handle_logout,
+            outputs=[status_display, api_key_display, login_panel,data_panel]
+        )
+
+        gr.HTML("""
+<style>
+
+    /* OUTER CARD */
+    .login-card {
+        border: 1px solid #444;
+        border-radius: 20px !important;
+        padding: 20px;
+        background: #1e1e24;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.25);
+    }
+
+    /* TEXTBOX + INPUT FIELDS */
+    .login-card .gr-textbox input,
+    .login-card .gr-textbox textarea,
+    .login-card input,
+    .login-card textarea {
+        border-radius: 12px !important;
+        padding: 10px 14px !important;
+        background: #2a2a30 !important;
+        border: 1px solid #555 !important;
+        color: white !important;
+    }
+
+    /* BUTTONS */
+    .login-card .gr-button > button,
+    .login-card .gr-button,
+    .login-card button {
+        border-radius: 12px !important;
+        padding: 10px 18px !important;
+    }
+
+    /* LABELS */
+    .login-card label {
+        font-size: 14px;
+        font-weight: 600;
+    }
+
+</style>
+""")
 
     return interface
 
