@@ -1,0 +1,24 @@
+/datasets/*[!.py]
+.ipynb_checkpoints
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*$py.class
+*.so
+training/*
+scripts/_nohup
+.rsync-filter
+*.pdf
+
+# Environment files with credentials
+.env
+**/.env
+
+# Database dumps (may contain user data)
+*.sql
+
+# PPG health data (sensitive)
+ppg_data/
+
+# Docker image exports
+all-images.tar

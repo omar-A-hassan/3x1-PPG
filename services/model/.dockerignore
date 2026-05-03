@@ -1,0 +1,30 @@
+# Python bytecode (recursive)
+__pycache__/
+*/__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Logs
+*.log
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+
+# ts2vec - only models/ folder is needed for inference
+ts2vec/datasets/
+ts2vec/scripts/
+ts2vec/tasks/
+ts2vec/README.md
+ts2vec/LICENSE
+ts2vec/requirements.txt
+ts2vec/train.py
+ts2vec/datautils.py
+ts2vec/utils.py
+ts2vec/ts2vec.py
