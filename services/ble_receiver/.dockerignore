@@ -1,0 +1,22 @@
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Local data (not needed in container)
+ppg_data/
+
+# Logs
+*.log
+
+# Git
+.git/
+.gitignore
+
+# Unused files
+main.py
+
+# IDE
+.vscode/
+.idea/

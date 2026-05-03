@@ -1,0 +1,466 @@
+================================================================================
+              SQL AUTHENTICATION SERVICE - INSTRUCTIONS FOR DEVELOPER
+================================================================================
+
+OVERVIEW
+--------
+You are building a database + API service that manages user accounts and API keys.
+Use whatever SQL database you prefer (SQL Server, PostgreSQL, MySQL, etc.).
+
+Other services will send HTTP requests to your service to:
+  - Register new users
+  - Login existing users  
+  - Validate API keys
+
+Your service owns the database. No other service touches the database directly.
+
+
+================================================================================
+WHAT YOU NEED TO BUILD
+================================================================================
+
+1. A SQL database (SQL Server, PostgreSQL, MySQL - your choice)
+2. A thin API layer to expose HTTP endpoints (see options below)
+3. Five HTTP endpoints that other services will call
+
+
+================================================================================
+DATABASE SETUP (SQL)
+================================================================================
+
+Create ONE table called "users":
+
+SQL Server syntax:
+    CREATE TABLE users (
+        id INT IDENTITY(1,1) PRIMARY KEY,
+        username NVARCHAR(100) UNIQUE NOT NULL,
+        password_hash NVARCHAR(256) NOT NULL,
+        api_key NVARCHAR(10) UNIQUE NOT NULL,
+        created_at DATETIME DEFAULT GETDATE()
+    );
+
+PostgreSQL syntax:
+    CREATE TABLE users (
+        id SERIAL PRIMARY KEY,
+        username VARCHAR(100) UNIQUE NOT NULL,
+        password_hash VARCHAR(256) NOT NULL,
+        api_key VARCHAR(10) UNIQUE NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+MySQL syntax:
+    CREATE TABLE users (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        username VARCHAR(100) UNIQUE NOT NULL,
+        password_hash VARCHAR(256) NOT NULL,
+        api_key VARCHAR(10) UNIQUE NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+Columns explained:
+  - id: Auto-incrementing unique identifier
+  - username: The user's chosen username (must be unique)
+  - password_hash: The password after hashing (NEVER store plain passwords)
+  - api_key: A 5-character code (3 letters + 2 numbers, like "KBT72")
+  - created_at: When the account was created
+
+
+================================================================================
+STORED PROCEDURES (OPTIONAL BUT RECOMMENDED)
+================================================================================
+
+You can create stored procedures to handle the logic:
+
+-- Register User
+CREATE PROCEDURE sp_RegisterUser
+    @username NVARCHAR(100),
+    @password_hash NVARCHAR(256),
+    @api_key NVARCHAR(10)
+AS
+BEGIN
+    IF EXISTS (SELECT 1 FROM users WHERE username = @username)
+    BEGIN
+        SELECT 'error' AS status, 'Username already exists' AS message;
+        RETURN;
+    END
+    
+    INSERT INTO users (username, password_hash, api_key)
+    VALUES (@username, @password_hash, @api_key);
+    
+    SELECT 'success' AS status, @username AS username, @api_key AS api_key;
+END;
+
+-- Login User
+CREATE PROCEDURE sp_LoginUser
+    @username NVARCHAR(100),
+    @password_hash NVARCHAR(256)
+AS
+BEGIN
+    SELECT username, api_key 
+    FROM users 
+    WHERE username = @username AND password_hash = @password_hash;
+END;
+
+-- Validate API Key
+CREATE PROCEDURE sp_ValidateApiKey
+    @api_key NVARCHAR(10)
+AS
+BEGIN
+    SELECT username FROM users WHERE api_key = @api_key;
+END;
+
+-- Regenerate API Key
+CREATE PROCEDURE sp_RegenerateApiKey
+    @username NVARCHAR(100),
+    @password_hash NVARCHAR(256),
+    @new_api_key NVARCHAR(10)
+AS
+BEGIN
+    IF EXISTS (SELECT 1 FROM users WHERE username = @username AND password_hash = @password_hash)
+    BEGIN
+        UPDATE users SET api_key = @new_api_key WHERE username = @username;
+        SELECT 'success' AS status, @new_api_key AS new_api_key;
+    END
+    ELSE
+    BEGIN
+        SELECT 'error' AS status, 'Invalid credentials' AS message;
+    END
+END;
+
+
+================================================================================
+WHAT IS AN ENDPOINT? (API BASICS)
+================================================================================
+
+An endpoint is a URL on your server that accepts HTTP requests and returns data.
+
+Example: If your server runs on port 8004, the endpoint "/login" means:
+         http://localhost:8004/login
+
+Other services will send POST requests to your endpoints with JSON data.
+Your endpoints receive the data, run SQL queries, and return JSON responses.
+
+You need a thin "API layer" between the database and the HTTP requests.
+
+
+================================================================================
+OPTIONS FOR THE API LAYER
+================================================================================
+
+Pick ONE of these approaches to expose your SQL database via HTTP:
+
+OPTION A: ASP.NET Core Web API (C# / .NET)
+  - Best if you know C# and SQL Server
+  - Look up: "ASP.NET Core Web API tutorial"
+  - Uses Entity Framework or raw ADO.NET for SQL
+
+OPTION B: Node.js + Express
+  - Best if you know JavaScript
+  - Look up: "Express.js REST API tutorial"
+  - Use "mssql" package for SQL Server, "pg" for PostgreSQL, "mysql2" for MySQL
+
+OPTION C: Flask or FastAPI (Python)
+  - Best if you know Python
+  - Look up: "Flask REST API tutorial" or "FastAPI tutorial"
+  - Use "pyodbc" for SQL Server, "psycopg2" for PostgreSQL
+
+OPTION D: SQL Server + Azure Functions / AWS Lambda
+  - Serverless approach
+  - Each endpoint is a separate function that runs SQL
+
+OPTION E: Use a tool like PostgREST or Hasura
+  - Auto-generates REST API from your PostgreSQL database
+  - Minimal code required
+
+
+================================================================================
+ENDPOINTS YOU MUST CREATE
+================================================================================
+
+All endpoints use POST method (except /health) and accept/return JSON.
+Your service MUST run on port 8004.
+
+
+------------------------------------------------------------------------------
+ENDPOINT 1: POST /register
+------------------------------------------------------------------------------
+Purpose: Create a new user account
+
+Receives this JSON:
+{
+    "username": "omar",
+    "password": "mypassword123"
+}
+
+Your logic:
+1. Hash the password (use SHA256 or bcrypt - NEVER store plain text)
+2. Generate random API key: 3 uppercase letters + 2 digits (like "KBT72")
+3. Check if username exists → SELECT COUNT(*) FROM users WHERE username = ?
+4. If exists, return error
+5. If not, INSERT INTO users (username, password_hash, api_key) VALUES (?, ?, ?)
+6. Return success with the API key
+
+Returns on success (HTTP status 201):
+{
+    "success": true,
+    "username": "omar",
+    "api_key": "KBT72"
+}
+
+Returns on error (HTTP status 400):
+{
+    "success": false,
+    "error": "Username already exists"
+}
+
+
+------------------------------------------------------------------------------
+ENDPOINT 2: POST /login
+------------------------------------------------------------------------------
+Purpose: Verify username/password and return the user's API key
+
+Receives this JSON:
+{
+    "username": "omar",
+    "password": "mypassword123"
+}
+
+Your logic:
+1. Hash the provided password (same method as registration)
+2. SELECT api_key FROM users WHERE username = ? AND password_hash = ?
+3. If row found, return success with API key
+4. If no row, return error
+
+Returns on success (HTTP status 200):
+{
+    "success": true,
+    "username": "omar",
+    "api_key": "KBT72"
+}
+
+Returns on error (HTTP status 401):
+{
+    "success": false,
+    "error": "Invalid username or password"
+}
+
+
+------------------------------------------------------------------------------
+ENDPOINT 3: POST /validate-api-key
+------------------------------------------------------------------------------
+Purpose: Check if an API key exists (called by the receiver service)
+
+Receives this JSON:
+{
+    "api_key": "KBT72"
+}
+
+Your logic:
+1. SELECT username FROM users WHERE api_key = ?
+2. If row found, return valid=true and the username
+3. If no row, return valid=false
+
+Returns if valid (HTTP status 200):
+{
+    "valid": true,
+    "username": "omar"
+}
+
+Returns if invalid (HTTP status 401):
+{
+    "valid": false
+}
+
+
+------------------------------------------------------------------------------
+ENDPOINT 4: POST /regenerate-api-key
+------------------------------------------------------------------------------
+Purpose: Generate a new API key for a user
+
+Receives this JSON:
+{
+    "username": "omar",
+    "password": "mypassword123"
+}
+
+Your logic:
+1. Verify credentials (same as login)
+2. Generate new random API key
+3. UPDATE users SET api_key = ? WHERE username = ?
+4. Return the new API key
+
+Returns on success (HTTP status 200):
+{
+    "success": true,
+    "new_api_key": "XYZ99"
+}
+
+Returns on error (HTTP status 401):
+{
+    "success": false,
+    "error": "Invalid credentials"
+}
+
+
+------------------------------------------------------------------------------
+ENDPOINT 5: GET /health
+------------------------------------------------------------------------------
+Purpose: Simple check that the service is running
+
+No input required. Just return:
+{
+    "status": "healthy"
+}
+
+
+================================================================================
+PASSWORD HASHING
+================================================================================
+
+NEVER store plain text passwords. Hash them before storing.
+
+SQL Server (T-SQL):
+    SELECT HASHBYTES('SHA2_256', @password)
+
+C# / .NET:
+    using System.Security.Cryptography;
+    SHA256.HashData(Encoding.UTF8.GetBytes(password))
+
+JavaScript / Node.js:
+    const crypto = require('crypto');
+    crypto.createHash('sha256').update(password).digest('hex')
+
+Python:
+    import hashlib
+    hashlib.sha256(password.encode()).hexdigest()
+
+
+================================================================================
+API KEY GENERATION
+================================================================================
+
+Generate a random 5-character code: 3 uppercase letters + 2 digits
+
+Example output: "KBT72", "XYZ99", "ABC12"
+
+C# / .NET:
+    var random = new Random();
+    string letters = new string(Enumerable.Range(0, 3)
+        .Select(_ => (char)random.Next('A', 'Z' + 1)).ToArray());
+    string numbers = random.Next(10, 100).ToString();
+    string apiKey = letters + numbers;
+
+JavaScript / Node.js:
+    const letters = Array.from({length: 3}, () => 
+        String.fromCharCode(65 + Math.floor(Math.random() * 26))).join('');
+    const numbers = Math.floor(Math.random() * 90 + 10);
+    const apiKey = letters + numbers;
+
+Python:
+    import random, string
+    letters = ''.join(random.choices(string.ascii_uppercase, k=3))
+    numbers = str(random.randint(10, 99))
+    api_key = letters + numbers
+
+
+================================================================================
+WHAT TO LOOK UP
+================================================================================
+
+Based on your chosen stack:
+
+If using ASP.NET Core:
+  - "ASP.NET Core Web API tutorial"
+  - "ADO.NET SQL Server connection"
+  - "ASP.NET Core return JSON response"
+
+If using Node.js + Express:
+  - "Express.js REST API tutorial"
+  - "Node.js mssql package" (for SQL Server)
+  - "Express.js POST request JSON body"
+
+If using Python + Flask:
+  - "Flask REST API tutorial"
+  - "pyodbc SQL Server connection"
+  - "Flask return JSON"
+
+General:
+  - "REST API HTTP status codes"
+  - "Postman API testing" - tool to test your endpoints
+  - "curl POST JSON" - command line testing
+
+
+================================================================================
+HOW TO TEST YOUR ENDPOINTS
+================================================================================
+
+Option 1: Postman (GUI application)
+  - Download from https://www.postman.com/
+  - Create POST requests with JSON body
+  - See responses visually
+
+Option 2: curl (command line)
+
+  Test register:
+  curl -X POST http://localhost:8004/register -H "Content-Type: application/json" -d "{\"username\":\"testuser\",\"password\":\"testpass\"}"
+
+  Test login:
+  curl -X POST http://localhost:8004/login -H "Content-Type: application/json" -d "{\"username\":\"testuser\",\"password\":\"testpass\"}"
+
+  Test validate:
+  curl -X POST http://localhost:8004/validate-api-key -H "Content-Type: application/json" -d "{\"api_key\":\"ABC12\"}"
+
+Option 3: Your API framework's built-in docs
+  - ASP.NET Core with Swagger: http://localhost:8004/swagger
+  - FastAPI: http://localhost:8004/docs
+
+
+================================================================================
+REQUIREMENTS SUMMARY
+================================================================================
+
+✓ Service runs on port 8004
+✓ 5 endpoints with exact JSON formats above
+✓ Passwords are hashed (never plain text)
+✓ API keys are 5 characters (3 letters + 2 digits)
+✓ Returns correct HTTP status codes (200, 201, 400, 401)
+
+
+================================================================================
+COMMUNICATION WITH OTHER SERVICES
+================================================================================
+
+Your service will be called by:
+
+1. UI Service → calls /register and /login
+   - When user creates account or logs in
+   - Returns API key to display to user
+
+2. Receiver Service → calls /validate-api-key
+   - When ESP32 device sends data with an API key
+   - Checks if the key is valid before accepting data
+
+You don't need to know how those services work internally.
+
+
+================================================================================
+WHEN YOU'RE DONE
+================================================================================
+
+Tell me when all 5 endpoints are working and tested. I will then:
+1. Connect the login UI to your /login and /register endpoints
+2. Connect the receiver to your /validate-api-key endpoint
+3. We test the full flow together
+
+
+================================================================================
+QUESTIONS?
+================================================================================
+
+If anything is unclear, ask about:
+  - What JSON format to expect/return
+  - How the endpoints will be called
+  - HTTP status codes
+  - Testing approaches
+
+================================================================================

@@ -1,0 +1,63 @@
+version: '3.8'
+
+services:
+  ble_receiver:
+    build: ./services/ble_receiver
+    ports:
+      - "8000:8000"
+    networks:
+      - ppg_network
+    environment:
+      - PREPROCESSING_SERVICE_URL=http://preprocessing:8001
+      - UI_SERVICE_URL=http://ui:8003
+      - AUTH_SERVICE_URL=http://auth:8004
+    restart: unless-stopped
+
+  preprocessing:
+    build: ./services/preprocessing
+    ports:
+      - "8001:8001"
+    networks:
+      - ppg_network
+    environment:
+      - MODEL_SERVICE_URL=http://model:8002
+    restart: unless-stopped
+
+  model:
+    build: ./services/model
+    ports:
+      - "8002:8002"
+    networks:
+      - ppg_network
+    environment:
+      - UI_SERVICE_URL=http://ui:8003
+    restart: unless-stopped
+
+  ui:
+    build: ./services/ui
+    ports:
+      - "8003:8003"
+    networks:
+      - ppg_network
+    environment:
+      - RECEIVER_SERVICE_URL=http://ble_receiver:8000
+      - PREPROCESSING_SERVICE_URL=http://preprocessing:8001
+      - AUTH_SERVICE_URL=http://auth:8004
+    restart: unless-stopped
+
+  auth:
+    build: ./services/auth_service
+    ports:
+      - "8004:8004"
+    networks:
+      - ppg_network
+    environment:
+      - DB_HOST=host.docker.internal
+      - DB_USER=root
+      - DB_PASSWORD=Yazan@sql19
+      - DB_DATABASE=authentication
+    restart: unless-stopped
+
+networks:
+  ppg_network:
+    driver: bridge
